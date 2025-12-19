@@ -95,19 +95,24 @@ def flatten_event(event):
     # Parse outcomes and prices
     outcomes_raw = market.get("outcomes", "[]")
     prices_raw = market.get("outcomePrices", "[]")
+    token_ids_raw = market.get("clobTokenIds", "[]")
 
     try:
         outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
         prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+        token_ids = json.loads(token_ids_raw) if isinstance(token_ids_raw, str) else token_ids_raw
     except json.JSONDecodeError:
         outcomes = ["", ""]
         prices = ["", ""]
+        token_ids = ["", ""]
 
     # Ensure we have 2 outcomes and prices
     outcome_1 = outcomes[0] if len(outcomes) > 0 else ""
     outcome_2 = outcomes[1] if len(outcomes) > 1 else ""
     price_1 = prices[0] if len(prices) > 0 else ""
     price_2 = prices[1] if len(prices) > 1 else ""
+    token_id_1 = token_ids[0] if len(token_ids) > 0 else ""
+    token_id_2 = token_ids[1] if len(token_ids) > 1 else ""
 
     is_closed = event.get("closed", False)
     winner = determine_winner(outcomes, prices, is_closed)
@@ -127,6 +132,9 @@ def flatten_event(event):
         "price_1": price_1,
         "price_2": price_2,
         "winner": winner,
+        "condition_id": market.get("conditionId", ""),
+        "token_id_1": token_id_1,
+        "token_id_2": token_id_2,
     }
 
 
@@ -139,7 +147,8 @@ def save_to_csv(events, filename):
     fieldnames = [
         "event_id", "title", "slug", "start_date", "end_date",
         "active", "closed", "liquidity", "volume",
-        "outcome_1", "outcome_2", "price_1", "price_2", "winner"
+        "outcome_1", "outcome_2", "price_1", "price_2", "winner",
+        "condition_id", "token_id_1", "token_id_2"
     ]
 
     # Flatten all events
