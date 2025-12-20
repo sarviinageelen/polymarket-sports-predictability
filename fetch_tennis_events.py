@@ -9,6 +9,7 @@ import time
 from datetime import datetime
 
 import requests
+from tqdm import tqdm
 
 
 API_URL = "https://gamma-api.polymarket.com/events"
@@ -45,18 +46,19 @@ def fetch_all_tennis_events():
     all_events = []
     offset = 0
 
-    while True:
-        print(f"Fetching events (offset={offset})...")
-        events = fetch_tennis_events_page(offset)
+    with tqdm(desc="Fetching events", unit=" pages") as pbar:
+        while True:
+            events = fetch_tennis_events_page(offset)
 
-        if not events:
-            break
+            if not events:
+                break
 
-        all_events.extend(events)
-        offset += PAGE_SIZE
+            all_events.extend(events)
+            offset += PAGE_SIZE
+            pbar.update(1)
 
-        # Small delay to avoid rate limiting
-        time.sleep(0.2)
+            # Small delay to avoid rate limiting
+            time.sleep(0.2)
 
     return all_events
 
@@ -301,12 +303,9 @@ def save_to_csv(events, filename):
         "p1_close", "p2_close",
     ]
 
-    # Flatten all events (with progress indicator for price fetching)
-    print(f"Fetching historical prices for {len(events)} events...")
+    # Flatten all events (with progress bar for price fetching)
     flattened = []
-    for i, event in enumerate(events):
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"  Processing event {i + 1}/{len(events)}...")
+    for event in tqdm(events, desc="Processing events"):
         flattened.append(flatten_event(event))
 
     with open(filename, "w", newline="", encoding="utf-8") as csvfile:
@@ -320,9 +319,8 @@ def save_to_csv(events, filename):
 def main():
     """Main entry point."""
     try:
-        print(f"Fetching tennis events from {API_URL}...")
         all_events = fetch_all_tennis_events()
-        print(f"Found {len(all_events)} total tennis events.")
+        print(f"\nFound {len(all_events)} total tennis events.")
 
         # Filter to moneyline events only
         moneyline_events = [e for e in all_events if is_moneyline_event(e)]
