@@ -4,11 +4,14 @@ Fetch sports metadata from Polymarket API and save to CSV.
 """
 
 import csv
+
 import requests
 
+# Connection pooling - reuse HTTP connections
+SESSION = requests.Session()
 
 API_URL = "https://gamma-api.polymarket.com/sports"
-OUTPUT_FILE = "polymarket_sports.csv"
+OUTPUT_FILE = "fetch_sports.csv"
 
 # Sport category mapping (lowercase, database-friendly)
 SPORT_CATEGORIES = {
@@ -60,7 +63,7 @@ def get_category(sport_code):
 
 def fetch_sports_data():
     """Fetch sports metadata from the Polymarket API."""
-    response = requests.get(API_URL)
+    response = SESSION.get(API_URL)
     response.raise_for_status()
     return response.json()
 
@@ -73,19 +76,21 @@ def save_to_csv(data, filename):
 
     fieldnames = ["category", "sport", "image", "resolution", "ordering", "tags", "series"]
     unmapped_sports = []
+    processed_data = []
 
-    # Add category to each row
+    # Create new rows with category (avoid mutating original data)
     for row in data:
         sport_code = row.get("sport", "")
         category = get_category(sport_code)
-        row["category"] = category
+        new_row = {**row, "category": category}
+        processed_data.append(new_row)
         if category == "unknown" and sport_code:
             unmapped_sports.append(sport_code)
 
     with open(filename, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(data)
+        writer.writerows(processed_data)
 
     print(f"Saved {len(data)} records to {filename}")
 
