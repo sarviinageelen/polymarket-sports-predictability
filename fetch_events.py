@@ -3,23 +3,22 @@
 Fetch tennis moneyline events from Polymarket API and save to CSV.
 
 Optimized version with:
-- Connection pooling (requests.Session)
-- Parallel price fetching for both tokens
-- Parallel event processing with ThreadPoolExecutor
-- Binary search for O(log n) price lookups
+- Async/await with aiohttp for concurrent CLOB API price fetching
+- Connection pooling for gamma-api requests
 - Smart rate limiting with exponential backoff
 - Excel-friendly CSV formatting
 - 2025 events only for better data completeness
 """
 
+import asyncio
 import csv
 import json
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from threading import Lock
 
+import aiohttp
 import requests
 from tqdm import tqdm
 
@@ -32,16 +31,15 @@ logger = logging.getLogger(__name__)
 
 API_URL = "https://gamma-api.polymarket.com/events"
 PRICES_API_URL = "https://clob.polymarket.com/prices-history"
-TRADES_API_URL = "https://data-api.polymarket.com/trades"
 TENNIS_TAG_ID = 864
 OUTPUT_FILE = "fetch_events.csv"
 PAGE_SIZE = 100
-MAX_WORKERS = 8  # Number of parallel workers for event processing
+MAX_WORKERS = 8  # Number of concurrent async tasks for event processing
 
 # Minimum year for events (filter out older data with incomplete price history)
 MIN_YEAR = 2025
 
-# Connection pooling - reuse HTTP connections
+# Connection pooling for gamma-api requests
 SESSION = requests.Session()
 
 # Cached tag-to-sport mapping (populated at runtime)
@@ -200,74 +198,25 @@ def fetch_all_tennis_events():
     return all_events
 
 
-def fetch_price_history(token_id, start_ts, end_ts):
-    """Fetch price history for a token within a time range."""
+async def fetch_price_history(session, token_id, start_ts, end_ts):
+    """Fetch price history for a token using aiohttp."""
+    if not token_id:
+        return []
     params = {
         "market": token_id,
         "startTs": start_ts,
         "endTs": end_ts,
-        "fidelity": 60,
+        "fidelity": 5,
     }
     try:
-        _wait_for_rate_limit()
-        time.sleep(0.1)  # Proactive delay to avoid hitting rate limits
-        response = SESSION.get(PRICES_API_URL, params=params)
-        if _handle_rate_limit(response):
-            response = SESSION.get(PRICES_API_URL, params=params)
-        response.raise_for_status()
-        return response.json().get("history", [])
-    except requests.RequestException:
+        async with session.get(PRICES_API_URL, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                return data.get("history", [])
+            return []
+    except Exception:
         return []
 
-
-def fetch_trades_for_condition(condition_id):
-    """Fetch all trades for a market from the Data-API.
-
-    This is used as a fallback when CLOB prices-history returns no data.
-    """
-    params = {
-        "market": condition_id,
-        "limit": 10000,
-    }
-    try:
-        _wait_for_rate_limit()
-        time.sleep(0.1)
-        response = SESSION.get(TRADES_API_URL, params=params)
-        if _handle_rate_limit(response):
-            response = SESSION.get(TRADES_API_URL, params=params)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException:
-        return []
-
-
-def derive_closing_from_trades(trades, token_id_1, token_id_2):
-    """Derive closing prices from trade history.
-
-    Finds the last non-resolution trade for each token.
-    Resolution trades have price 0.0 or 1.0.
-    """
-    if not trades:
-        return {"p1_close": None, "p2_close": None}
-
-    # Group trades by asset (token_id) and find last non-resolution price
-    last_price_by_asset = {}
-
-    # Sort by timestamp to process in order
-    sorted_trades = sorted(trades, key=lambda x: x.get("timestamp", 0))
-
-    for trade in sorted_trades:
-        asset = trade.get("asset", "")
-        price = trade.get("price")
-        if price is not None:
-            # Filter out resolution prices (0.0 or 1.0)
-            if 0.02 < price < 0.98:
-                last_price_by_asset[asset] = price
-
-    return {
-        "p1_close": last_price_by_asset.get(token_id_1),
-        "p2_close": last_price_by_asset.get(token_id_2),
-    }
 
 
 def get_true_closing_price(sorted_history):
@@ -286,93 +235,51 @@ def get_true_closing_price(sorted_history):
     return None
 
 
-def _fetch_both_histories(token_id_1, token_id_2, start_ts, end_ts):
-    """Fetch price histories for both tokens in parallel."""
-    history_1 = []
-    history_2 = []
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {}
-        if token_id_1:
-            futures[executor.submit(fetch_price_history, token_id_1, start_ts, end_ts)] = 1
-        if token_id_2:
-            futures[executor.submit(fetch_price_history, token_id_2, start_ts, end_ts)] = 2
-
-        for future in as_completed(futures):
-            player = futures[future]
-            try:
-                result = future.result()
-                if player == 1:
-                    history_1 = result
-                else:
-                    history_2 = result
-            except Exception as e:
-                token_id = token_id_1 if player == 1 else token_id_2
-                logger.warning("Failed to fetch price history for token %s: %s", token_id, e)
-
+async def _fetch_both_histories(session, token_id_1, token_id_2, start_ts, end_ts):
+    """Fetch price histories for both tokens in parallel using asyncio."""
+    history_1, history_2 = await asyncio.gather(
+        fetch_price_history(session, token_id_1, start_ts, end_ts),
+        fetch_price_history(session, token_id_2, start_ts, end_ts),
+    )
     return history_1, history_2
 
 
-def get_closing_prices(token_id_1, token_id_2, condition_id, start_date_str, end_date_str):
+async def get_closing_prices(session, token_id_1, token_id_2, condition_id, start_date_str):
     """Get closing prices for both players before match resolution.
 
-    Uses max(start_date, end_date) as the end of the time window to handle
-    cases where markets are created after the scheduled event time.
-
-    Falls back to Data-API trades if CLOB prices-history returns no data.
+    For sports matches, the match happens around start_date, not end_date.
+    end_date is often the scheduled market close (days/weeks later).
     """
     empty_prices = {"p1_close": None, "p2_close": None}
 
-    if not end_date_str and not start_date_str:
+    if not start_date_str:
         return empty_prices
 
     try:
-        # Parse both dates, using the other as fallback if one is missing
-        end_dt = None
-        start_dt = None
+        # Parse start_date - this is when the match is scheduled
+        start_dt = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
 
-        if end_date_str:
-            end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-        if start_date_str:
-            start_dt = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
-
-        # Use the LATER of the two dates as the end of the time window
-        # This handles cases where market was created after scheduled event time
-        if start_dt and end_dt:
-            effective_end_dt = max(start_dt, end_dt)
-        else:
-            effective_end_dt = end_dt or start_dt
-
-        # Extend 24 hours beyond to capture post-creation trading and resolution
-        # Markets created close to event time may have trading after the later date
-        effective_end_dt = effective_end_dt + timedelta(hours=24)
-
+        # The match happens around start_date. Look forward 48 hours to capture
+        # the match completion and market resolution
+        effective_end_dt = start_dt + timedelta(hours=48)
         end_ts = int(effective_end_dt.timestamp())
     except (ValueError, AttributeError):
         return empty_prices
 
-    # Fetch 7 days of price history to ensure we capture closing prices
+    # Look back 7 days from the match to capture pre-match trading
     start_ts = end_ts - (7 * 24 * 60 * 60)
 
     # Fetch price histories in parallel
-    history_1, history_2 = _fetch_both_histories(token_id_1, token_id_2, start_ts, end_ts)
+    history_1, history_2 = await _fetch_both_histories(session, token_id_1, token_id_2, start_ts, end_ts)
 
     # Sort histories for closing price extraction (filter items with missing timestamp)
     sorted_1 = sorted((h for h in history_1 if "t" in h), key=lambda x: x["t"]) if history_1 else []
     sorted_2 = sorted((h for h in history_2 if "t" in h), key=lambda x: x["t"]) if history_2 else []
 
-    closing = {
+    return {
         "p1_close": get_true_closing_price(sorted_1),
         "p2_close": get_true_closing_price(sorted_2),
     }
-
-    # Fallback to Data-API trades if CLOB returned no data
-    if closing["p1_close"] is None and closing["p2_close"] is None and condition_id:
-        trades = fetch_trades_for_condition(condition_id)
-        if trades:
-            closing = derive_closing_from_trades(trades, token_id_1, token_id_2)
-
-    return closing
 
 
 def determine_winner(outcomes, prices, is_closed):
@@ -401,7 +308,7 @@ def to_float(value):
         return None
 
 
-def process_event(event):
+async def process_event(session, event):
     """Process a single event: validate as moneyline and flatten.
 
     Returns flattened dict if valid moneyline event, None otherwise.
@@ -448,7 +355,7 @@ def process_event(event):
     condition_id = market.get("conditionId", "")
     start_date = event.get("startDate", "")
     end_date = event.get("endDate", "")
-    closing = get_closing_prices(token_id_1, token_id_2, condition_id, start_date, end_date)
+    closing = await get_closing_prices(session, token_id_1, token_id_2, condition_id, start_date)
 
     # Determine category and sport
     category, sport = determine_sport_for_event(event, TENNIS_TAG_ID)
@@ -481,8 +388,32 @@ def process_event(event):
     }
 
 
+async def process_events_async(events):
+    """Process all events concurrently with semaphore for rate limiting."""
+    semaphore = asyncio.Semaphore(MAX_WORKERS)
+    results = []
+
+    async with aiohttp.ClientSession() as session:
+        async def process_with_semaphore(event):
+            async with semaphore:
+                return await process_event(session, event)
+
+        # Create tasks for all events
+        tasks = [process_with_semaphore(event) for event in events]
+
+        # Process with progress bar
+        with tqdm(total=len(tasks), desc="Processing events") as pbar:
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                if result is not None:
+                    results.append(result)
+                pbar.update(1)
+
+    return results
+
+
 def save_to_csv(events, filename):
-    """Save processed moneyline events to a CSV file with parallel processing."""
+    """Save processed moneyline events to a CSV file with async processing."""
     if not events:
         print("No events to save.")
         return
@@ -499,17 +430,8 @@ def save_to_csv(events, filename):
         "volume",                                     # Trading
     ]
 
-    # Process events in parallel with progress bar
-    flattened = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_event, event): event for event in events}
-
-        with tqdm(total=len(events), desc="Processing events") as pbar:
-            for future in as_completed(futures):
-                result = future.result()
-                if result is not None:  # Filter out non-moneyline events
-                    flattened.append(result)
-                pbar.update(1)
+    # Process events asynchronously
+    flattened = asyncio.run(process_events_async(events))
 
     # Sort by start_date for consistent ordering
     flattened.sort(key=lambda x: x.get("start_date") or "")
