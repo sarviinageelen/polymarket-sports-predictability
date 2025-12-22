@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Fetch tennis moneyline events from Polymarket API and save to CSV.
+Fetch sports moneyline events from Polymarket API and save to CSV.
+
+Supports multiple sports: ATP, WTA, NBA, NFL, MLB, CFB, NCAAB
 
 Optimized version with:
 - Async/await with aiohttp for concurrent CLOB API price fetching
@@ -24,17 +26,39 @@ from tqdm import tqdm
 
 from fetch_sports import SPORT_CATEGORIES, fetch_sports_data
 
-# Configure logging
-logging.basicConfig(level=logging.WARNING)
+# Configure logging - changed to INFO to see debug messages
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
 API_URL = "https://gamma-api.polymarket.com/events"
 PRICES_API_URL = "https://clob.polymarket.com/prices-history"
-TENNIS_TAG_ID = 864
 OUTPUT_FILE = "fetch_events.csv"
 PAGE_SIZE = 100
 MAX_WORKERS = 8  # Number of concurrent async tasks for event processing
+
+# CLOB API configuration for reliable token IDs and market data
+CLOB_HOST = "https://clob.polymarket.com"
+CLOB_CHAIN_ID = 137
+
+# Sports to fetch: (tag_id, sport_codes that use this tag)
+# ATP and WTA share tag 864 - disambiguation happens via title matching
+# TESTING: Start with NBA only
+SPORTS_TO_FETCH = [
+    (745, ["nba"]),             # NBA (TEST FIRST)
+]
+# Full list (restore after testing):
+# SPORTS_TO_FETCH = [
+#     (864, ["atp", "wta"]),      # Tennis (ATP & WTA share tag)
+#     (745, ["nba"]),             # NBA
+#     (450, ["nfl"]),             # NFL
+#     (100381, ["mlb"]),          # MLB
+#     (100351, ["cfb"]),          # College Football
+#     (100149, ["ncaab"]),        # College Basketball
+# ]
 
 # Minimum year for events (filter out older data with incomplete price history)
 MIN_YEAR = 2025
@@ -77,6 +101,84 @@ def get_tag_to_sport_map():
     if _tag_to_sport_map is None:
         _tag_to_sport_map = build_tag_to_sport_mapping()
     return _tag_to_sport_map
+
+
+async def fetch_clob_markets_async():
+    """Fetch all markets from CLOB API with pagination.
+
+    Returns dict mapping condition_id -> market data with reliable token IDs,
+    game timing, and winner information.
+
+    Returns:
+        dict: {condition_id: {token_id_1, token_id_2, game_start_time, winner_index, ...}}
+    """
+    from py_clob_client.client import ClobClient
+    from functools import partial
+
+    client = ClobClient(host=CLOB_HOST, chain_id=CLOB_CHAIN_ID)
+    markets_map = {}
+    next_cursor = ""
+    page_count = 0
+
+    with tqdm(desc="Fetching CLOB markets", unit=" pages", leave=False) as pbar:
+        while True:
+            # Run synchronous get_markets() in thread pool for async compatibility
+            loop = asyncio.get_event_loop()
+            try:
+                if next_cursor == "":
+                    response = await loop.run_in_executor(None, client.get_markets)
+                else:
+                    response = await loop.run_in_executor(
+                        None,
+                        partial(client.get_markets, next_cursor=next_cursor)
+                    )
+            except Exception as e:
+                logger.error(f"Failed to fetch CLOB markets page {page_count}: {e}")
+                break
+
+            # Parse response
+            markets = response.get("data", [])
+            if not markets:
+                break
+
+            # Build condition_id mapping
+            for market in markets:
+                condition_id = market.get("condition_id")
+                if not condition_id:
+                    continue
+
+                tokens = market.get("tokens", [])
+                if len(tokens) != 2:
+                    continue  # Only moneyline markets (2 outcomes)
+
+                # Extract winner (if resolved)
+                winner_index = None
+                if tokens[0].get("winner") is True:
+                    winner_index = 0
+                elif tokens[1].get("winner") is True:
+                    winner_index = 1
+
+                markets_map[condition_id] = {
+                    "token_id_1": tokens[0].get("token_id", ""),
+                    "token_id_2": tokens[1].get("token_id", ""),
+                    "game_start_time": market.get("game_start_time"),
+                    "winner_index": winner_index,
+                    "closed": market.get("closed", False),
+                    "outcome_1": tokens[0].get("outcome", ""),
+                    "outcome_2": tokens[1].get("outcome", ""),
+                }
+
+            # Pagination
+            next_cursor = response.get("next_cursor", "")
+            page_count += 1
+            pbar.update(1)
+
+            # Check for end of pagination
+            if next_cursor == "LTE=" or not next_cursor:
+                break
+
+    logger.info(f"Fetched {len(markets_map)} CLOB markets across {page_count} pages")
+    return markets_map
 
 
 def determine_sport_for_event(event, tag_id):
@@ -159,10 +261,10 @@ def is_2025_or_later(date_str):
         return False
 
 
-def fetch_tennis_events_page(offset=0):
-    """Fetch a single page of tennis events."""
+def fetch_events_page(tag_id, offset=0):
+    """Fetch a single page of events for a given tag_id."""
     params = {
-        "tag_id": TENNIS_TAG_ID,
+        "tag_id": tag_id,
         "limit": PAGE_SIZE,
         "offset": offset,
     }
@@ -174,14 +276,14 @@ def fetch_tennis_events_page(offset=0):
     return response.json()
 
 
-def fetch_all_tennis_events():
-    """Fetch all tennis events with pagination, filtered to 2025+."""
+def fetch_all_events(tag_id):
+    """Fetch all events for a tag_id with pagination, filtered to 2025+."""
     all_events = []
     offset = 0
 
-    with tqdm(desc="Fetching events", unit=" pages") as pbar:
+    with tqdm(desc="Fetching events", unit=" pages", leave=False) as pbar:
         while True:
-            events = fetch_tennis_events_page(offset)
+            events = fetch_events_page(tag_id, offset)
 
             if not events:
                 break
@@ -201,6 +303,7 @@ def fetch_all_tennis_events():
 async def fetch_price_history(session, token_id, start_ts, end_ts):
     """Fetch price history for a token using aiohttp."""
     if not token_id:
+        logger.debug(f"Skipping price fetch - empty token_id")
         return []
     params = {
         "market": token_id,
@@ -212,73 +315,138 @@ async def fetch_price_history(session, token_id, start_ts, end_ts):
         async with session.get(PRICES_API_URL, params=params) as response:
             if response.status == 200:
                 data = await response.json()
-                return data.get("history", [])
-            return []
-    except Exception:
+                history = data.get("history", [])
+                logger.debug(f"Fetched {len(history)} price points for token {token_id[:8]}...")
+                return history
+            else:
+                logger.warning(f"Price API returned {response.status} for token {token_id[:8]}...")
+                return []
+    except Exception as e:
+        logger.error(f"Price fetch exception for token {token_id[:8]}...: {e}")
         return []
 
 
+async def fetch_price_history_with_retry(session, token_id, start_ts, end_ts, max_retries=3):
+    """Fetch price history with exponential backoff retry.
 
-def get_true_closing_price(sorted_history):
-    """Get the last non-resolution price from sorted history.
+    Retries up to max_retries times with exponential backoff (1s, 2s, 4s).
+    """
+    for attempt in range(max_retries):
+        try:
+            result = await fetch_price_history(session, token_id, start_ts, end_ts)
+            if result:  # Success
+                return result
 
-    Resolution prices are 1.0 (winner) or 0.0 (loser), which we filter out
-    to get the actual pre-match closing price.
+            # Empty result but no exception - may be transient
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # 1s, 2s, 4s
+                logger.debug(f"Empty result for token {token_id[:8]}..., retrying in {wait_time}s (attempt {attempt+1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.warning(f"Failed to fetch prices for token {token_id[:8]}... after {max_retries} attempts")
+                return []
+
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f"Price fetch error for token {token_id[:8]}...: {e}, retrying in {wait_time}s")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Failed to fetch prices for token {token_id[:8]}... after {max_retries} attempts: {e}")
+                return []
+
+    return []
+
+
+
+def get_price_at_match_start(sorted_history, match_start_ts):
+    """Get the price at or just before match start time.
+
+    This is the true pre-match closing price - the last price before the
+    game started, when live betting effects haven't yet moved the odds.
+
+    Args:
+        sorted_history: List of {t: timestamp, p: price} sorted by timestamp
+        match_start_ts: Unix timestamp of when the match started
+
+    Returns:
+        The price closest to (but not after) match start, or None if not found.
     """
     if not sorted_history:
         return None
-    # Iterate from end (most recent) to find non-resolution price
-    for i in range(len(sorted_history) - 1, -1, -1):
-        price = sorted_history[i].get("p")
-        if price is not None and 0.02 < price < 0.98:
-            return price
-    return None
+
+    # Find the last price entry at or before match start
+    best_price = None
+    for entry in sorted_history:
+        ts = entry.get("t")
+        price = entry.get("p")
+        if ts is None or price is None:
+            continue
+        if ts <= match_start_ts:
+            best_price = price
+        else:
+            # Past match start, stop looking
+            break
+
+    return best_price
 
 
 async def _fetch_both_histories(session, token_id_1, token_id_2, start_ts, end_ts):
-    """Fetch price histories for both tokens in parallel using asyncio."""
+    """Fetch price histories for both tokens in parallel using asyncio with retry logic."""
     history_1, history_2 = await asyncio.gather(
-        fetch_price_history(session, token_id_1, start_ts, end_ts),
-        fetch_price_history(session, token_id_2, start_ts, end_ts),
+        fetch_price_history_with_retry(session, token_id_1, start_ts, end_ts),
+        fetch_price_history_with_retry(session, token_id_2, start_ts, end_ts),
     )
     return history_1, history_2
 
 
-async def get_closing_prices(session, token_id_1, token_id_2, condition_id, start_date_str):
-    """Get closing prices for both players before match resolution.
+async def get_closing_prices(session, token_id_1, token_id_2, condition_id, game_start_time_str):
+    """Get closing prices for both players at game start time.
 
-    For sports matches, the match happens around start_date, not end_date.
-    end_date is often the scheduled market close (days/weeks later).
+    Uses CLOB game_start_time as the match time (accurate timing from CLOB API).
+
+    Args:
+        token_id_1: Token ID from CLOB (reliable)
+        token_id_2: Token ID from CLOB (reliable)
+        condition_id: Condition ID for logging
+        game_start_time_str: ISO timestamp of game start from CLOB
     """
     empty_prices = {"p1_close": None, "p2_close": None}
 
-    if not start_date_str:
+    if not game_start_time_str:
+        logger.warning(f"No game_start_time for condition {condition_id}")
         return empty_prices
 
     try:
-        # Parse start_date - this is when the match is scheduled
-        start_dt = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
+        # Parse CLOB game start time
+        game_dt = datetime.fromisoformat(game_start_time_str.replace("Z", "+00:00"))
+        game_start_ts = int(game_dt.timestamp())
 
-        # The match happens around start_date. Look forward 48 hours to capture
-        # the match completion and market resolution
-        effective_end_dt = start_dt + timedelta(hours=48)
-        end_ts = int(effective_end_dt.timestamp())
-    except (ValueError, AttributeError):
+        # Fetch history from 7 days before to 1 hour after game start
+        end_ts = game_start_ts + 3600  # 1 hour buffer
+        start_ts = game_start_ts - (7 * 24 * 60 * 60)  # 7 days before
+    except (ValueError, AttributeError) as e:
+        logger.error(f"Failed to parse game_start_time '{game_start_time_str}' for condition {condition_id}: {e}")
         return empty_prices
 
-    # Look back 7 days from the match to capture pre-match trading
-    start_ts = end_ts - (7 * 24 * 60 * 60)
-
-    # Fetch price histories in parallel
+    # Fetch price histories in parallel with retry logic
     history_1, history_2 = await _fetch_both_histories(session, token_id_1, token_id_2, start_ts, end_ts)
 
-    # Sort histories for closing price extraction (filter items with missing timestamp)
+    # Debug logging for empty histories
+    if not history_1 or not history_2:
+        logger.warning(
+            f"Price fetch failed for condition {condition_id}: "
+            f"token_1={token_id_1[:8]}... (len={len(history_1)}), "
+            f"token_2={token_id_2[:8]}... (len={len(history_2)})"
+        )
+
+    # Sort histories for price extraction (filter items with missing timestamp)
     sorted_1 = sorted((h for h in history_1 if "t" in h), key=lambda x: x["t"]) if history_1 else []
     sorted_2 = sorted((h for h in history_2 if "t" in h), key=lambda x: x["t"]) if history_2 else []
 
     return {
-        "p1_close": get_true_closing_price(sorted_1),
-        "p2_close": get_true_closing_price(sorted_2),
+        "p1_close": get_price_at_match_start(sorted_1, game_start_ts),
+        "p2_close": get_price_at_match_start(sorted_2, game_start_ts),
     }
 
 
@@ -308,29 +476,77 @@ def to_float(value):
         return None
 
 
-async def process_event(session, event):
-    """Process a single event: validate as moneyline and flatten.
+def find_moneyline_market(markets, event_title):
+    """Find the moneyline market from a list of markets.
+
+    For multi-market events, searches through all markets to find the
+    full-game moneyline (excludes spreads, totals, half/quarter lines).
+
+    Returns the moneyline market dict, or None if not found.
+    """
+    # Patterns that indicate non-moneyline markets
+    exclude_patterns = [
+        "spread", "o/u", "1h", "2h", "1q", "2q", "3q", "4q",
+        "over", "under", "total", "points", "margin", "half", "quarter"
+    ]
+
+    for market in markets:
+        # Parse outcomes
+        outcomes_raw = market.get("outcomes", "[]")
+        try:
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        except json.JSONDecodeError:
+            continue
+
+        # Must have exactly 2 outcomes
+        if len(outcomes) != 2:
+            continue
+
+        # Skip Yes/No and Over/Under markets
+        if "Yes" in outcomes or "No" in outcomes:
+            continue
+        if "Over" in outcomes or "Under" in outcomes:
+            continue
+
+        # Get market question/title
+        question = market.get("question", market.get("groupItemTitle", "")).lower()
+
+        # Skip markets with exclude patterns (spreads, totals, halves, etc.)
+        if any(pattern in question for pattern in exclude_patterns):
+            continue
+
+        # This looks like a moneyline market
+        return market
+
+    return None
+
+
+async def process_event(session, event, tag_id, clob_markets):
+    """Process a single event: validate as moneyline, enrich with CLOB data, and flatten.
 
     Returns flattened dict if valid moneyline event, None otherwise.
-    This combines is_moneyline_event() and flatten_event() into a single pass.
+    Now enriches gamma-api events with reliable CLOB market data.
     """
     markets = event.get("markets", [])
 
-    # Must have exactly 1 market
-    if len(markets) != 1:
+    if not markets:
         return None
 
-    market = markets[0]
+    # Find the moneyline market (handles both single and multi-market events)
+    if len(markets) == 1:
+        market = markets[0]
+    else:
+        market = find_moneyline_market(markets, event.get("title", ""))
+        if market is None:
+            return None
 
     # Parse JSON once and cache
     outcomes_raw = market.get("outcomes", "[]")
     prices_raw = market.get("outcomePrices", "[]")
-    token_ids_raw = market.get("clobTokenIds", "[]")
 
     try:
         outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
         prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-        token_ids = json.loads(token_ids_raw) if isinstance(token_ids_raw, str) else token_ids_raw
     except json.JSONDecodeError:
         return None
 
@@ -340,28 +556,63 @@ async def process_event(session, event):
     if "Yes" in outcomes or "No" in outcomes:
         return None
 
-    # Extract values (outcomes validated to have exactly 2 items above)
+    # Extract gamma-api values
     outcome_1 = outcomes[0]
     outcome_2 = outcomes[1]
     price_1 = to_float(prices[0]) if len(prices) > 0 else None
     price_2 = to_float(prices[1]) if len(prices) > 1 else None
-    token_id_1 = token_ids[0] if len(token_ids) > 0 else ""
-    token_id_2 = token_ids[1] if len(token_ids) > 1 else ""
-
     is_closed = event.get("closed", False)
-    winner = determine_winner(outcomes, prices, is_closed)
 
-    # Get closing prices for both players
+    # === CLOB ENRICHMENT ===
     condition_id = market.get("conditionId", "")
-    start_date = event.get("startDate", "")
-    end_date = event.get("endDate", "")
-    closing = await get_closing_prices(session, token_id_1, token_id_2, condition_id, start_date)
+    clob_data = clob_markets.get(condition_id)
+
+    if not clob_data:
+        logger.warning(f"No CLOB data for condition_id {condition_id} (title: {event.get('title', '')[:50]})")
+        return None  # Skip events without CLOB data
+
+    # Use CLOB token IDs (reliable) instead of gamma clobTokenIds
+    token_id_1 = clob_data["token_id_1"]
+    token_id_2 = clob_data["token_id_2"]
+
+    # Validate token IDs are not empty
+    if not token_id_1 or not token_id_2:
+        logger.error(f"Empty token IDs for condition {condition_id} - skipping")
+        return None
+
+    # Use CLOB game_start_time instead of gamma endDate
+    game_start_time = clob_data["game_start_time"]
+
+    # Warn if game_start_time is missing
+    if not game_start_time:
+        logger.warning(f"Missing game_start_time for condition {condition_id}")
+
+    # Use CLOB winner if available, otherwise fall back to gamma price inference
+    if clob_data["winner_index"] is not None:
+        winner = clob_data["outcome_1"] if clob_data["winner_index"] == 0 else clob_data["outcome_2"]
+    else:
+        winner = determine_winner(outcomes, prices, is_closed)  # Fallback
+
+    # Warn if CLOB outcomes don't match gamma outcomes (for validation)
+    if clob_data["outcome_1"] != outcome_1 or clob_data["outcome_2"] != outcome_2:
+        logger.debug(
+            f"Outcome mismatch for condition {condition_id}: "
+            f"gamma=({outcome_1}, {outcome_2}) vs CLOB=({clob_data['outcome_1']}, {clob_data['outcome_2']})"
+        )
+        # Use CLOB outcomes as source of truth
+        outcome_1 = clob_data["outcome_1"]
+        outcome_2 = clob_data["outcome_2"]
+
+    # === END CLOB ENRICHMENT ===
+
+    # Get closing prices using RELIABLE CLOB token IDs and game_start_time
+    start_date = event.get("startDate", "")  # Market creation date
+    closing = await get_closing_prices(session, token_id_1, token_id_2, condition_id, game_start_time)
 
     # Determine category and sport
-    category, sport = determine_sport_for_event(event, TENNIS_TAG_ID)
+    category, sport = determine_sport_for_event(event, tag_id)
 
-    # Return in chronological order:
-    # Category → Identification → Timing → Players → Closing Prices → Result → Trading
+    # Return in chronological order with NEW schema
     return {
         # Category
         "category": category,
@@ -371,15 +622,20 @@ async def process_event(session, event):
         "condition_id": condition_id,
         "title": event.get("title", ""),
         "slug": event.get("slug", ""),
-        # Timing
-        "start_date": format_date_for_excel(event.get("startDate", "")),
-        "end_date": format_date_for_excel(end_date),
+        # Timing - NEW NAMES
+        "market_created_date": format_date_for_excel(start_date),
+        "game_start_time": format_date_for_excel(game_start_time),
         # Players
         "outcome_1": outcome_1,
         "outcome_2": outcome_2,
+        # Token IDs - NEW
+        "token_id_1": token_id_1,
+        "token_id_2": token_id_2,
         # Closing prices
         "p1_close": closing.get("p1_close"),
         "p2_close": closing.get("p2_close"),
+        # Draw detection - NEW (placeholder for now)
+        "is_50_50_outcome": None,  # Not available in current APIs
         # Result
         "closed": 1 if is_closed else 0,
         "winner": winner,
@@ -388,21 +644,24 @@ async def process_event(session, event):
     }
 
 
-async def process_events_async(events):
-    """Process all events concurrently with semaphore for rate limiting."""
+async def process_events_async(events, tag_id, clob_markets):
+    """Process all events concurrently with semaphore for rate limiting.
+
+    Now requires clob_markets dict for enriching events with reliable CLOB data.
+    """
     semaphore = asyncio.Semaphore(MAX_WORKERS)
     results = []
 
     async with aiohttp.ClientSession() as session:
         async def process_with_semaphore(event):
             async with semaphore:
-                return await process_event(session, event)
+                return await process_event(session, event, tag_id, clob_markets)
 
         # Create tasks for all events
         tasks = [process_with_semaphore(event) for event in events]
 
         # Process with progress bar
-        with tqdm(total=len(tasks), desc="Processing events") as pbar:
+        with tqdm(total=len(tasks), desc="Processing events", leave=False) as pbar:
             for coro in asyncio.as_completed(tasks):
                 result = await coro
                 if result is not None:
@@ -412,29 +671,24 @@ async def process_events_async(events):
     return results
 
 
-def save_to_csv(events, filename):
-    """Save processed moneyline events to a CSV file with async processing."""
-    if not events:
+def save_to_csv(flattened_events, filename):
+    """Save pre-processed moneyline events to a CSV file."""
+    if not flattened_events:
         print("No events to save.")
         return
 
-    # Columns in chronological order:
-    # Category → Identification → Timing → Players → Closing Prices → Result → Trading
+    # NEW SCHEMA with token IDs and renamed date fields
     fieldnames = [
-        "category", "sport",                          # Category
-        "event_id", "condition_id", "title", "slug",  # Identification
-        "start_date", "end_date",                     # Timing
-        "outcome_1", "outcome_2",                     # Players
-        "p1_close", "p2_close",                       # Closing prices
-        "closed", "winner",                           # Result
-        "volume",                                     # Trading
+        "category", "sport",                                      # Category
+        "event_id", "condition_id", "title", "slug",              # Identification
+        "market_created_date", "game_start_time",                 # Timing (RENAMED)
+        "outcome_1", "outcome_2",                                 # Players
+        "token_id_1", "token_id_2",                               # Token IDs (NEW)
+        "p1_close", "p2_close",                                   # Closing prices
+        "is_50_50_outcome",                                       # Draw detection (NEW)
+        "closed", "winner",                                       # Result
+        "volume",                                                 # Trading
     ]
-
-    # Process events asynchronously
-    flattened = asyncio.run(process_events_async(events))
-
-    # Sort by start_date for consistent ordering
-    flattened.sort(key=lambda x: x.get("start_date") or "")
 
     # Write CSV with proper formatting (QUOTE_MINIMAL avoids quoting numbers)
     with open(filename, "w", newline="", encoding="utf-8") as csvfile:
@@ -445,9 +699,9 @@ def save_to_csv(events, filename):
             extrasaction="ignore",
         )
         writer.writeheader()
-        writer.writerows(flattened)
+        writer.writerows(flattened_events)
 
-    print(f"Saved {len(flattened)} moneyline events to {filename}")
+    print(f"Saved {len(flattened_events)} moneyline events to {filename}")
 
 
 def main():
@@ -457,12 +711,93 @@ def main():
         print("Loading sports metadata...")
         get_tag_to_sport_map()
 
-        print(f"Fetching events from {MIN_YEAR} onwards...")
-        all_events = fetch_all_tennis_events()
-        print(f"\nFound {len(all_events)} events from {MIN_YEAR}+.")
+        # === NEW: Fetch CLOB markets ONCE at start ===
+        print("\nFetching CLOB markets...")
+        clob_markets = asyncio.run(fetch_clob_markets_async())
+        print(f"Loaded {len(clob_markets)} CLOB markets")
+        # === END NEW ===
 
-        # Process all events (filtering happens inside save_to_csv now)
-        save_to_csv(all_events, OUTPUT_FILE)
+        all_flattened = []
+
+        for tag_id, sport_codes in SPORTS_TO_FETCH:
+            sport_label = "/".join(sport_codes).upper()
+            print(f"\nFetching {sport_label} events (tag {tag_id})...")
+
+            events = fetch_all_events(tag_id)
+            print(f"Found {len(events)} {sport_label} events from {MIN_YEAR}+")
+
+            if events:
+                # Process events for this sport
+                print(f"Processing {sport_label} events...")
+                # === NEW: Pass clob_markets to processing ===
+                flattened = asyncio.run(process_events_async(events, tag_id, clob_markets))
+                # === END NEW ===
+                all_flattened.extend(flattened)
+                print(f"Processed {len(flattened)} {sport_label} moneyline events")
+
+        # Sort all events by game_start_time (NEW field name)
+        all_flattened.sort(key=lambda x: x.get("game_start_time") or "")
+
+        # Write combined CSV
+        print(f"\nWriting {len(all_flattened)} total events to {OUTPUT_FILE}...")
+        save_to_csv(all_flattened, OUTPUT_FILE)
+
+        # === NEW: DATA QUALITY METRICS ===
+        print("\n" + "=" * 60)
+        print("DATA QUALITY REPORT")
+        print("=" * 60)
+
+        total_events = len(all_flattened)
+        closed_events = sum(1 for e in all_flattened if e.get("closed") == 1)
+
+        # Count events with closing prices
+        has_prices = sum(
+            1 for e in all_flattened
+            if e.get("p1_close") is not None and e.get("p2_close") is not None
+        )
+
+        # Count closed events with closing prices
+        closed_with_prices = sum(
+            1 for e in all_flattened
+            if e.get("closed") == 1
+            and e.get("p1_close") is not None
+            and e.get("p2_close") is not None
+        )
+
+        # Count events with winners
+        has_winner = sum(1 for e in all_flattened if e.get("winner"))
+
+        print(f"Total events:              {total_events:>6}")
+        print(f"Closed events:             {closed_events:>6} ({100*closed_events/total_events if total_events > 0 else 0:.1f}%)")
+        print(f"Events with prices:        {has_prices:>6} ({100*has_prices/total_events if total_events > 0 else 0:.1f}%)")
+        print(f"Closed with prices:        {closed_with_prices:>6} ({100*closed_with_prices/closed_events if closed_events > 0 else 0:.1f}% of closed)")
+        print(f"Events with winner:        {has_winner:>6} ({100*has_winner/closed_events if closed_events > 0 else 0:.1f}% of closed)")
+        print(f"\nData completeness:         {100*closed_with_prices/closed_events if closed_events > 0 else 0:.1f}% ← TARGET: >90%")
+        print("=" * 60)
+
+        # Per-sport breakdown
+        print("\nPer-Sport Breakdown:")
+        print(f"{'Sport':<20} {'Total':>8} {'Closed':>8} {'With Prices':>12} {'Completeness':>12}")
+        print("-" * 65)
+
+        sports = set(e.get("sport") for e in all_flattened)
+        for sport in sorted(sports):
+            sport_events = [e for e in all_flattened if e.get("sport") == sport]
+            sport_total = len(sport_events)
+            sport_closed = sum(1 for e in sport_events if e.get("closed") == 1)
+            sport_prices = sum(
+                1 for e in sport_events
+                if e.get("closed") == 1
+                and e.get("p1_close") is not None
+                and e.get("p2_close") is not None
+            )
+            completeness = 100 * sport_prices / sport_closed if sport_closed > 0 else 0
+
+            print(f"{sport.upper():<20} {sport_total:>8} {sport_closed:>8} {sport_prices:>12} {completeness:>11.1f}%")
+
+        print("=" * 60)
+        # === END DATA QUALITY METRICS ===
+
     except requests.RequestException as e:
         print(f"Error fetching data: {e}")
         raise SystemExit(1)

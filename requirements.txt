@@ -1,3 +1,4 @@
 aiohttp
 requests
 tqdm
+py-clob-client>=0.17.4
