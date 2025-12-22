@@ -52,7 +52,8 @@ SPORTS_TO_FETCH = [
     (450, ["nfl"]),             # NFL
     (100381, ["mlb"]),          # MLB
     (100351, ["cfb"]),          # College Football
-    (100149, ["ncaab"]),        # College Basketball
+    (100149, ["ncaab"]),        # College Basketball (March Madness)
+    (101178, ["cbb"]),          # College Basketball (Regular Season)
 ]
 
 # Minimum year for events (filter out older data with incomplete price history)

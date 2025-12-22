@@ -21,8 +21,9 @@ SPORT_DISPLAY_NAMES = {
     "nba": "NBA",
     "nfl": "NFL",
     "mlb": "MLB",
-    "cfb": "College Football",
-    "ncaab": "College Basketball",
+    "cfb": "CFB",
+    "ncaab": "CBB",
+    "cbb": "CBB",
 }
 
 # Chart styling
@@ -51,9 +52,12 @@ def calculate_favourite_win_rates(df):
     closed_df = df[df["closed"] == 1].copy()
     print(f"Analyzing {len(closed_df)} closed events")
 
+    # Merge ncaab and cbb into single "cbb" category
+    closed_df["sport"] = closed_df["sport"].replace({"ncaab": "cbb"})
+
     results = {}
 
-    for sport in df["sport"].unique():
+    for sport in closed_df["sport"].unique():
         sport_df = closed_df[closed_df["sport"] == sport]
 
         if len(sport_df) == 0:
@@ -106,6 +110,7 @@ def create_chart(data, output_file):
     # Prepare data for plotting
     sports = []
     win_rates = []
+    sample_sizes = []
 
     # Sort by win rate descending
     sorted_data = sorted(data.items(), key=lambda x: x[1][0], reverse=True)
@@ -114,39 +119,41 @@ def create_chart(data, output_file):
         display_name = SPORT_DISPLAY_NAMES.get(sport_code, sport_code.upper())
         sports.append(display_name)
         win_rates.append(win_rate)
+        sample_sizes.append((sport_code, total))
 
-    # Create figure with The Athletic's style
-    fig, ax = plt.subplots(figsize=(10, 7))
+    # Reverse lists so highest appears at top (matplotlib plots index 0 at bottom)
+    sports.reverse()
+    win_rates.reverse()
+    sample_sizes.reverse()
+
+    # Create figure with 16:9 widescreen format (1920x1080 at 150 dpi)
+    fig, ax = plt.subplots(figsize=(12.8, 7.2))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
     ax.set_facecolor(BACKGROUND_COLOR)
 
-    # Create horizontal bars (reversed so highest is at top)
+    # Create horizontal bars with better spacing
     y_pos = range(len(sports))
-    bars = ax.barh(y_pos, win_rates, color=BAR_COLOR, height=0.7)
+    bars = ax.barh(y_pos, win_rates, color=BAR_COLOR, height=0.65)
 
-    # Add percentage labels inside bars
+    # Add percentage labels at end of bars (outside for visibility)
     for i, (bar, rate) in enumerate(zip(bars, win_rates)):
-        # Position label inside the bar, near the right edge
-        label_x = bar.get_width() - 3 if bar.get_width() > 15 else bar.get_width() + 1
-        text_color = "white" if bar.get_width() > 15 else TEXT_COLOR
-        ha = "right" if bar.get_width() > 15 else "left"
-
         ax.text(
-            label_x, bar.get_y() + bar.get_height() / 2,
+            bar.get_width() + 2,
+            bar.get_y() + bar.get_height() / 2,
             f"{rate:.0f}%",
-            va="center", ha=ha,
-            fontsize=14, fontweight="bold",
-            color=text_color
+            va="center", ha="left",
+            fontsize=20, fontweight="bold",
+            color=TEXT_COLOR
         )
 
-    # Set sport names on y-axis
+    # Set sport names on y-axis (left-aligned, larger font)
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(sports, fontsize=13)
+    ax.set_yticklabels(sports, fontsize=18, ha="right")
 
     # Set x-axis range and labels
-    ax.set_xlim(0, 100)
+    ax.set_xlim(0, 110)  # Extra space for labels
     ax.set_xticks([0, 20, 40, 60, 80])
-    ax.set_xticklabels(["0%", "20%", "40%", "60%", "80%"], fontsize=11, color="#666666")
+    ax.set_xticklabels(["0%", "20%", "40%", "60%", "80%"], fontsize=14, color="#888888")
 
     # Add light vertical grid lines
     ax.xaxis.grid(True, color=GRID_COLOR, linestyle="-", linewidth=0.5)
@@ -160,28 +167,41 @@ def create_chart(data, output_file):
     ax.tick_params(axis="y", length=0)
     ax.tick_params(axis="x", length=0)
 
-    # Add title and subtitle
+    # Add title and subtitle (reduced size)
     fig.text(
-        0.12, 0.95,
+        0.06, 0.93,
         "How often do favourites win?",
-        fontsize=22, fontweight="bold",
+        fontsize=28, fontweight="bold",
         color=TEXT_COLOR, ha="left"
     )
     fig.text(
-        0.12, 0.90,
+        0.06, 0.88,
         "Average favourite win rates by sport",
-        fontsize=13, color="#666666", ha="left"
+        fontsize=15, color="#777777", ha="left"
     )
 
-    # Add footer note
+    # Build sample size footer (single line)
+    sample_parts = []
+    for code, total in sample_sizes:
+        sport_name = SPORT_DISPLAY_NAMES.get(code, code.upper())
+        sample_parts.append(f"{sport_name}: {total:,}")
+
+    sample_text = "  |  ".join(sample_parts)
+
+    # Add footer notes
     fig.text(
-        0.12, 0.02,
+        0.06, 0.08,
         "Favourites calculated using Polymarket closing prices",
-        fontsize=9, color="#999999", ha="left", style="italic"
+        fontsize=11, color="#999999", ha="left", style="italic"
+    )
+    fig.text(
+        0.06, 0.04,
+        f"Sample sizes: {sample_text}",
+        fontsize=10, color="#999999", ha="left"
     )
 
     # Adjust layout
-    plt.subplots_adjust(left=0.25, right=0.95, top=0.85, bottom=0.08)
+    plt.subplots_adjust(left=0.18, right=0.90, top=0.84, bottom=0.12)
 
     # Save chart
     plt.savefig(output_file, dpi=150, facecolor=BACKGROUND_COLOR, bbox_inches="tight")
