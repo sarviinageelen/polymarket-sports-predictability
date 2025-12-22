@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 API_URL = "https://gamma-api.polymarket.com/events"
 PRICES_API_URL = "https://clob.polymarket.com/prices-history"
-OUTPUT_FILE = "fetch_events.csv"
+OUTPUT_FILE = "../data/fetch_events.csv"
 PAGE_SIZE = 100
 MAX_WORKERS = 8  # Number of concurrent async tasks for event processing
 

@@ -11,8 +11,8 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
 # Input/Output files
-INPUT_FILE = "fetch_events.csv"
-OUTPUT_FILE = "favourite_win_rates.png"
+INPUT_FILE = "../data/fetch_events.csv"
+OUTPUT_FILE = "../outputs/favourite_win_rates.png"
 
 # Sport display names (code -> display name)
 SPORT_DISPLAY_NAMES = {
@@ -131,18 +131,18 @@ def create_chart(data, output_file):
     fig.patch.set_facecolor(BACKGROUND_COLOR)
     ax.set_facecolor(BACKGROUND_COLOR)
 
-    # Create horizontal bars with better spacing
+    # Create horizontal bars with optimal spacing for readability
     y_pos = range(len(sports))
-    bars = ax.barh(y_pos, win_rates, color=BAR_COLOR, height=0.65)
+    bars = ax.barh(y_pos, win_rates, color=BAR_COLOR, height=0.7)
 
-    # Add percentage labels at end of bars (outside for visibility)
+    # Add percentage labels at end of bars with clear spacing
     for i, (bar, rate) in enumerate(zip(bars, win_rates)):
         ax.text(
-            bar.get_width() + 2,
+            bar.get_width() + 1.5,
             bar.get_y() + bar.get_height() / 2,
             f"{rate:.0f}%",
             va="center", ha="left",
-            fontsize=20, fontweight="bold",
+            fontsize=22, fontweight="bold",
             color=TEXT_COLOR
         )
 
@@ -188,20 +188,20 @@ def create_chart(data, output_file):
 
     sample_text = "  |  ".join(sample_parts)
 
-    # Add footer notes (positioned to avoid overlap with graph)
+    # Add footer notes (positioned below axis to avoid overlap)
     fig.text(
-        0.06, 0.06,
+        0.06, 0.04,
         "Favourites calculated using Polymarket closing prices",
         fontsize=11, color="#999999", ha="left", style="italic"
     )
     fig.text(
-        0.06, 0.02,
+        0.06, 0.01,
         f"Sample sizes: {sample_text}",
         fontsize=10, color="#999999", ha="left"
     )
 
     # Adjust layout with better spacing for widescreen format
-    plt.subplots_adjust(left=0.15, right=0.92, top=0.83, bottom=0.10)
+    plt.subplots_adjust(left=0.15, right=0.92, top=0.83, bottom=0.12)
 
     # Save chart
     plt.savefig(output_file, dpi=150, facecolor=BACKGROUND_COLOR, bbox_inches="tight")

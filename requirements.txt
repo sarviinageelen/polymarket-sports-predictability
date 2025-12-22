@@ -2,3 +2,7 @@ aiohttp
 requests
 tqdm
 py-clob-client>=0.17.4
+pandas
+matplotlib
+pytest>=7.0.0
+pytest-cov>=4.0.0

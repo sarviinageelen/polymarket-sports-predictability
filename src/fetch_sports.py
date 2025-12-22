@@ -11,7 +11,7 @@ import requests
 SESSION = requests.Session()
 
 API_URL = "https://gamma-api.polymarket.com/sports"
-OUTPUT_FILE = "fetch_sports.csv"
+OUTPUT_FILE = "../data/fetch_sports.csv"
 
 # Sport category mapping (lowercase, database-friendly)
 SPORT_CATEGORIES = {
