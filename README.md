@@ -1,6 +1,6 @@
 # Polymarket Sports Predictability Analysis
 
-Statistical analysis of favorite win rates across 7,141 sports prediction markets using hybrid API architecture.
+Statistical analysis of favorite win rates across sports prediction markets using hybrid API architecture.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
