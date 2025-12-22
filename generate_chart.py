@@ -188,20 +188,20 @@ def create_chart(data, output_file):
 
     sample_text = "  |  ".join(sample_parts)
 
-    # Add footer notes
+    # Add footer notes (positioned to avoid overlap with graph)
     fig.text(
-        0.06, 0.08,
+        0.06, 0.06,
         "Favourites calculated using Polymarket closing prices",
         fontsize=11, color="#999999", ha="left", style="italic"
     )
     fig.text(
-        0.06, 0.04,
+        0.06, 0.02,
         f"Sample sizes: {sample_text}",
         fontsize=10, color="#999999", ha="left"
     )
 
-    # Adjust layout
-    plt.subplots_adjust(left=0.18, right=0.90, top=0.84, bottom=0.12)
+    # Adjust layout with better spacing for widescreen format
+    plt.subplots_adjust(left=0.15, right=0.92, top=0.83, bottom=0.10)
 
     # Save chart
     plt.savefig(output_file, dpi=150, facecolor=BACKGROUND_COLOR, bbox_inches="tight")
