@@ -46,19 +46,14 @@ CLOB_CHAIN_ID = 137
 
 # Sports to fetch: (tag_id, sport_codes that use this tag)
 # ATP and WTA share tag 864 - disambiguation happens via title matching
-# TESTING: Start with NBA only
 SPORTS_TO_FETCH = [
-    (745, ["nba"]),             # NBA (TEST FIRST)
+    (864, ["atp", "wta"]),      # Tennis (ATP & WTA share tag)
+    (745, ["nba"]),             # NBA
+    (450, ["nfl"]),             # NFL
+    (100381, ["mlb"]),          # MLB
+    (100351, ["cfb"]),          # College Football
+    (100149, ["ncaab"]),        # College Basketball
 ]
-# Full list (restore after testing):
-# SPORTS_TO_FETCH = [
-#     (864, ["atp", "wta"]),      # Tennis (ATP & WTA share tag)
-#     (745, ["nba"]),             # NBA
-#     (450, ["nfl"]),             # NFL
-#     (100381, ["mlb"]),          # MLB
-#     (100351, ["cfb"]),          # College Football
-#     (100149, ["ncaab"]),        # College Basketball
-# ]
 
 # Minimum year for events (filter out older data with incomplete price history)
 MIN_YEAR = 2025
@@ -147,6 +142,12 @@ async def fetch_clob_markets_async():
                 if not condition_id:
                     continue
 
+                # Filter to active, non-archived markets only
+                if market.get("archived", False):
+                    continue
+                if not market.get("active", True):
+                    continue
+
                 tokens = market.get("tokens", [])
                 if len(tokens) != 2:
                     continue  # Only moneyline markets (2 outcomes)
@@ -162,10 +163,14 @@ async def fetch_clob_markets_async():
                     "token_id_1": tokens[0].get("token_id", ""),
                     "token_id_2": tokens[1].get("token_id", ""),
                     "game_start_time": market.get("game_start_time"),
+                    "end_date_iso": market.get("end_date_iso"),  # Fallback timing
                     "winner_index": winner_index,
                     "closed": market.get("closed", False),
                     "outcome_1": tokens[0].get("outcome", ""),
                     "outcome_2": tokens[1].get("outcome", ""),
+                    "is_50_50_outcome": market.get("is_50_50_outcome", False),
+                    "tags": market.get("tags", []),
+                    "question": market.get("question", ""),
                 }
 
             # Pagination
@@ -583,9 +588,13 @@ async def process_event(session, event, tag_id, clob_markets):
     # Use CLOB game_start_time instead of gamma endDate
     game_start_time = clob_data["game_start_time"]
 
-    # Warn if game_start_time is missing
+    # Use end_date_iso as fallback if game_start_time is missing
     if not game_start_time:
-        logger.warning(f"Missing game_start_time for condition {condition_id}")
+        game_start_time = clob_data.get("end_date_iso")
+        if game_start_time:
+            logger.debug(f"Using end_date_iso fallback for condition {condition_id}")
+        else:
+            logger.warning(f"Missing game_start_time and end_date_iso for condition {condition_id}")
 
     # Use CLOB winner if available, otherwise fall back to gamma price inference
     if clob_data["winner_index"] is not None:
@@ -634,8 +643,8 @@ async def process_event(session, event, tag_id, clob_markets):
         # Closing prices
         "p1_close": closing.get("p1_close"),
         "p2_close": closing.get("p2_close"),
-        # Draw detection - NEW (placeholder for now)
-        "is_50_50_outcome": None,  # Not available in current APIs
+        # Draw detection - NEW
+        "is_50_50_outcome": 1 if clob_data.get("is_50_50_outcome", False) else 0,
         # Result
         "closed": 1 if is_closed else 0,
         "winner": winner,
@@ -735,8 +744,8 @@ def main():
                 all_flattened.extend(flattened)
                 print(f"Processed {len(flattened)} {sport_label} moneyline events")
 
-        # Sort all events by game_start_time (NEW field name)
-        all_flattened.sort(key=lambda x: x.get("game_start_time") or "")
+        # Sort by sport first, then by game_start_time (recent to old)
+        all_flattened.sort(key=lambda x: (x.get("sport") or "", -(int(datetime.fromisoformat((x.get("game_start_time") or "1970-01-01 00:00:00").replace(" ", "T")).timestamp()) if x.get("game_start_time") else 0)))
 
         # Write combined CSV
         print(f"\nWriting {len(all_flattened)} total events to {OUTPUT_FILE}...")
