@@ -4,6 +4,7 @@ Fetch sports metadata from Polymarket API and save to CSV.
 """
 
 import csv
+from pathlib import Path
 
 import requests
 
@@ -11,7 +12,10 @@ import requests
 SESSION = requests.Session()
 
 API_URL = "https://gamma-api.polymarket.com/sports"
-OUTPUT_FILE = "../data/fetch_sports.csv"
+
+# Use absolute path to work from any directory
+PROJECT_ROOT = Path(__file__).parent.parent
+OUTPUT_FILE = PROJECT_ROOT / "data" / "fetch_sports.csv"
 
 # Sport category mapping (lowercase, database-friendly)
 SPORT_CATEGORIES = {
@@ -87,10 +91,24 @@ def save_to_csv(data, filename):
         if category == "unknown" and sport_code:
             unmapped_sports.append(sport_code)
 
-    with open(filename, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(processed_data)
+    # Ensure parent directory exists
+    filepath = Path(filename)
+    try:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError) as e:
+        print(f"ERROR: Cannot create directory {filepath.parent}: {e}")
+        raise
+
+    # Write CSV with error handling
+    try:
+        with open(filepath, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(processed_data)
+    except (PermissionError, OSError) as e:
+        print(f"ERROR: Cannot write to file {filepath}: {e}")
+        print("Possible causes: insufficient permissions, disk full, or file locked by another process")
+        raise
 
     print(f"Saved {len(data)} records to {filename}")
 
@@ -110,6 +128,9 @@ def main():
     except requests.RequestException as e:
         print(f"Error fetching data: {e}")
         raise SystemExit(1)
+    finally:
+        # Clean up HTTP session resources
+        SESSION.close()
 
 
 if __name__ == "__main__":

@@ -6,13 +6,16 @@ Creates a horizontal bar chart showing favourite win rates by sport,
 styled similar to The Athletic's sports analytics charts.
 """
 
+from pathlib import Path
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
-# Input/Output files
-INPUT_FILE = "../data/fetch_events.csv"
-OUTPUT_FILE = "../outputs/favourite_win_rates.png"
+# Use absolute paths to work from any directory
+PROJECT_ROOT = Path(__file__).parent.parent
+INPUT_FILE = PROJECT_ROOT / "data" / "fetch_events.csv"
+OUTPUT_FILE = PROJECT_ROOT / "outputs" / "favourite_win_rates.png"
 
 # Sport display names (code -> display name)
 SPORT_DISPLAY_NAMES = {
@@ -34,9 +37,33 @@ GRID_COLOR = "#E0E0E0"  # Light gray for grid
 
 
 def load_data(filename):
-    """Load event data from CSV file."""
-    df = pd.read_csv(filename)
+    """Load event data from CSV file with schema validation."""
+    # Check file exists
+    filepath = Path(filename)
+    if not filepath.exists():
+        raise FileNotFoundError(
+            f"CSV file not found: {filename}\n"
+            f"Please run fetch_events.py first to generate the data."
+        )
+
+    df = pd.read_csv(filepath)
     print(f"Loaded {len(df)} events from {filename}")
+
+    # Validate required columns exist
+    required_columns = [
+        "sport", "closed", "p1_close", "p2_close",
+        "outcome_1", "outcome_2", "winner"
+    ]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+
+    if missing_columns:
+        raise ValueError(
+            f"CSV schema validation failed. Missing required columns: {missing_columns}\n"
+            f"Expected columns: {required_columns}\n"
+            f"Found columns: {list(df.columns)}\n"
+            f"The CSV file may be from an older version or corrupted."
+        )
+
     return df
 
 
@@ -73,8 +100,12 @@ def calculate_favourite_win_rates(df):
             outcome_1 = row["outcome_1"]
             outcome_2 = row["outcome_2"]
 
-            # Skip rows with missing data
+            # Skip rows with missing data or empty winner
             if pd.isna(p1_close) or pd.isna(p2_close) or pd.isna(winner):
+                continue
+
+            # Also skip if winner is empty string or whitespace-only
+            if not str(winner).strip():
                 continue
 
             # Identify the favourite (higher closing price)
@@ -203,8 +234,12 @@ def create_chart(data, output_file):
     # Adjust layout with better spacing for widescreen format
     plt.subplots_adjust(left=0.15, right=0.92, top=0.83, bottom=0.12)
 
+    # Ensure output directory exists
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     # Save chart
-    plt.savefig(output_file, dpi=150, facecolor=BACKGROUND_COLOR, bbox_inches="tight")
+    plt.savefig(output_path, dpi=150, facecolor=BACKGROUND_COLOR, bbox_inches="tight")
     plt.close()
 
     print(f"\nChart saved to {output_file}")

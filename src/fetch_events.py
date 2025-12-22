@@ -18,6 +18,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from threading import Lock
 
 import aiohttp
@@ -36,7 +37,10 @@ logger = logging.getLogger(__name__)
 
 API_URL = "https://gamma-api.polymarket.com/events"
 PRICES_API_URL = "https://clob.polymarket.com/prices-history"
-OUTPUT_FILE = "../data/fetch_events.csv"
+
+# Use absolute path to work from any directory
+PROJECT_ROOT = Path(__file__).parent.parent
+OUTPUT_FILE = PROJECT_ROOT / "data" / "fetch_events.csv"
 PAGE_SIZE = 100
 MAX_WORKERS = 8  # Number of concurrent async tasks for event processing
 
@@ -116,7 +120,12 @@ async def fetch_clob_markets_async():
     next_cursor = ""
     page_count = 0
 
-    with tqdm(desc="Fetching CLOB markets", unit=" pages", leave=False) as pbar:
+    with tqdm(
+        desc="Fetching CLOB markets",
+        unit="pages",
+        leave=False,
+        mininterval=0.5
+    ) as pbar:
         while True:
             # Run synchronous get_markets() in thread pool for async compatibility
             loop = asyncio.get_event_loop()
@@ -180,6 +189,9 @@ async def fetch_clob_markets_async():
             pbar.update(1)
 
             # Check for end of pagination
+            # Note: "LTE=" is the sentinel value returned by CLOB API to indicate
+            # end of pagination (likely base64-encoded empty value or "<=").
+            # This is an undocumented API behavior observed empirically.
             if next_cursor == "LTE=" or not next_cursor:
                 break
 
@@ -218,12 +230,21 @@ _backoff_until = 0
 
 
 def _wait_for_rate_limit():
-    """Wait if we're in a backoff period."""
+    """Wait if we're in a backoff period.
+
+    Thread-safe: Only holds lock for reading backoff time, not during sleep.
+    This prevents blocking other threads unnecessarily.
+    """
     global _backoff_until
+
+    # Read backoff time inside lock (fast operation)
     with _rate_limit_lock:
         now = time.time()
-        if now < _backoff_until:
-            time.sleep(_backoff_until - now)
+        sleep_time = max(0, _backoff_until - now)
+
+    # Sleep OUTSIDE lock to avoid blocking other threads
+    if sleep_time > 0:
+        time.sleep(sleep_time)
 
 
 def _handle_rate_limit(response):
@@ -282,12 +303,17 @@ def fetch_events_page(tag_id, offset=0):
     return response.json()
 
 
-def fetch_all_events(tag_id):
+def fetch_all_events(tag_id, sport_label="Unknown"):
     """Fetch all events for a tag_id with pagination, filtered to 2025+."""
     all_events = []
     offset = 0
 
-    with tqdm(desc="Fetching events", unit=" pages", leave=False) as pbar:
+    with tqdm(
+        desc=f"Fetching {sport_label} events",
+        unit="pages",
+        leave=False,
+        mininterval=0.5
+    ) as pbar:
         while True:
             events = fetch_events_page(tag_id, offset)
 
@@ -377,9 +403,26 @@ def get_price_at_match_start(sorted_history, match_start_ts):
 
     Returns:
         The price closest to (but not after) match start, or None if not found.
+
+    Note:
+        The caller MUST ensure sorted_history is sorted by timestamp ascending.
+        We validate this in debug mode to catch caller errors.
     """
     if not sorted_history:
         return None
+
+    # Validate sorting (only check first few for performance)
+    # This catches common caller errors where history is unsorted
+    if len(sorted_history) >= 2:
+        for i in range(min(5, len(sorted_history) - 1)):
+            t1 = sorted_history[i].get("t")
+            t2 = sorted_history[i + 1].get("t")
+            if t1 is not None and t2 is not None and t1 > t2:
+                logger.error(
+                    f"Price history not sorted! Found timestamp {t1} > {t2} at index {i}. "
+                    f"This will produce incorrect closing prices."
+                )
+                # Still continue, but data will be wrong
 
     # Find the last price entry at or before match start
     best_price = None
@@ -397,16 +440,21 @@ def get_price_at_match_start(sorted_history, match_start_ts):
     return best_price
 
 
-async def _fetch_both_histories(session, token_id_1, token_id_2, start_ts, end_ts):
+async def _fetch_both_histories(session, token_id_1, token_id_2, start_ts, end_ts, price_stats=None):
     """Fetch price histories for both tokens in parallel using asyncio with retry logic."""
     history_1, history_2 = await asyncio.gather(
         fetch_price_history_with_retry(session, token_id_1, start_ts, end_ts),
         fetch_price_history_with_retry(session, token_id_2, start_ts, end_ts),
     )
+
+    # Update price fetch counter
+    if price_stats is not None:
+        price_stats["fetched"] += 2
+
     return history_1, history_2
 
 
-async def get_closing_prices(session, token_id_1, token_id_2, condition_id, game_start_time_str):
+async def get_closing_prices(session, token_id_1, token_id_2, condition_id, game_start_time_str, price_stats=None):
     """Get closing prices for both players at game start time.
 
     Uses CLOB game_start_time as the match time (accurate timing from CLOB API).
@@ -416,6 +464,7 @@ async def get_closing_prices(session, token_id_1, token_id_2, condition_id, game
         token_id_2: Token ID from CLOB (reliable)
         condition_id: Condition ID for logging
         game_start_time_str: ISO timestamp of game start from CLOB
+        price_stats: Optional dict for tracking price API calls
     """
     empty_prices = {"p1_close": None, "p2_close": None}
 
@@ -436,7 +485,7 @@ async def get_closing_prices(session, token_id_1, token_id_2, condition_id, game
         return empty_prices
 
     # Fetch price histories in parallel with retry logic
-    history_1, history_2 = await _fetch_both_histories(session, token_id_1, token_id_2, start_ts, end_ts)
+    history_1, history_2 = await _fetch_both_histories(session, token_id_1, token_id_2, start_ts, end_ts, price_stats)
 
     # Debug logging for empty histories
     if not history_1 or not history_2:
@@ -527,7 +576,7 @@ def find_moneyline_market(markets, event_title):
     return None
 
 
-async def process_event(session, event, tag_id, clob_markets):
+async def process_event(session, event, tag_id, clob_markets, price_stats=None):
     """Process a single event: validate as moneyline, enrich with CLOB data, and flatten.
 
     Returns flattened dict if valid moneyline event, None otherwise.
@@ -581,10 +630,29 @@ async def process_event(session, event, tag_id, clob_markets):
     token_id_1 = clob_data["token_id_1"]
     token_id_2 = clob_data["token_id_2"]
 
-    # Validate token IDs are not empty
+    # Validate token IDs are not empty and have reasonable format
     if not token_id_1 or not token_id_2:
         logger.error(f"Empty token IDs for condition {condition_id} - skipping")
         return None
+
+    # Basic format validation: token IDs should be hex strings (0x followed by hex digits)
+    # Typical format: "0x1234567890abcdef..."
+    if not (isinstance(token_id_1, str) and isinstance(token_id_2, str)):
+        logger.error(f"Invalid token ID types for condition {condition_id}: {type(token_id_1)}, {type(token_id_2)}")
+        return None
+
+    if not (token_id_1.startswith("0x") and token_id_2.startswith("0x")):
+        logger.warning(
+            f"Token IDs for condition {condition_id} don't start with '0x': "
+            f"token_1={token_id_1[:20]}..., token_2={token_id_2[:20]}..."
+        )
+        # Continue anyway - format may have changed
+
+    if len(token_id_1) < 10 or len(token_id_2) < 10:
+        logger.warning(
+            f"Unusually short token IDs for condition {condition_id}: "
+            f"len(token_1)={len(token_id_1)}, len(token_2)={len(token_id_2)}"
+        )
 
     # Use CLOB game_start_time instead of gamma endDate
     game_start_time = clob_data["game_start_time"]
@@ -599,7 +667,18 @@ async def process_event(session, event, tag_id, clob_markets):
 
     # Use CLOB winner if available, otherwise fall back to gamma price inference
     if clob_data["winner_index"] is not None:
-        winner = clob_data["outcome_1"] if clob_data["winner_index"] == 0 else clob_data["outcome_2"]
+        # Validate winner_index is 0 or 1 (expected values for 2-outcome markets)
+        if clob_data["winner_index"] == 0:
+            winner = clob_data["outcome_1"]
+        elif clob_data["winner_index"] == 1:
+            winner = clob_data["outcome_2"]
+        else:
+            # Unexpected winner_index value - log and use fallback
+            logger.error(
+                f"Unexpected winner_index={clob_data['winner_index']} for condition {condition_id}. "
+                f"Expected 0 or 1 for 2-outcome market. Using price-based fallback."
+            )
+            winner = determine_winner(outcomes, prices, is_closed)
     else:
         winner = determine_winner(outcomes, prices, is_closed)  # Fallback
 
@@ -617,7 +696,7 @@ async def process_event(session, event, tag_id, clob_markets):
 
     # Get closing prices using RELIABLE CLOB token IDs and game_start_time
     start_date = event.get("startDate", "")  # Market creation date
-    closing = await get_closing_prices(session, token_id_1, token_id_2, condition_id, game_start_time)
+    closing = await get_closing_prices(session, token_id_1, token_id_2, condition_id, game_start_time, price_stats)
 
     # Determine category and sport
     category, sport = determine_sport_for_event(event, tag_id)
@@ -654,7 +733,7 @@ async def process_event(session, event, tag_id, clob_markets):
     }
 
 
-async def process_events_async(events, tag_id, clob_markets):
+async def process_events_async(events, tag_id, clob_markets, sport_label="Unknown"):
     """Process all events concurrently with semaphore for rate limiting.
 
     Now requires clob_markets dict for enriching events with reliable CLOB data.
@@ -662,23 +741,60 @@ async def process_events_async(events, tag_id, clob_markets):
     semaphore = asyncio.Semaphore(MAX_WORKERS)
     results = []
 
+    # Track price API calls
+    price_stats = {"fetched": 0, "total": len(events) * 2}
+
     async with aiohttp.ClientSession() as session:
         async def process_with_semaphore(event):
             async with semaphore:
-                return await process_event(session, event, tag_id, clob_markets)
+                return await process_event(session, event, tag_id, clob_markets, price_stats)
 
         # Create tasks for all events
         tasks = [process_with_semaphore(event) for event in events]
 
         # Process with progress bar
-        with tqdm(total=len(tasks), desc="Processing events", leave=False) as pbar:
+        with tqdm(
+            total=len(tasks),
+            desc=f"Processing {sport_label}",
+            unit="events",
+            leave=False,
+            mininterval=0.5,
+            postfix={"prices": f"0/{price_stats['total']}"}
+        ) as pbar:
             for coro in asyncio.as_completed(tasks):
                 result = await coro
                 if result is not None:
                     results.append(result)
+                pbar.set_postfix(prices=f"{price_stats['fetched']}/{price_stats['total']}")
                 pbar.update(1)
 
     return results
+
+
+def get_sort_key(event):
+    """Extract sort key for event: (sport, -timestamp).
+
+    Returns tuple for sorting events by sport alphabetically,
+    then by game time in descending order (most recent first).
+    Handles invalid dates gracefully by defaulting to epoch (1970).
+    """
+    sport = event.get("sport") or ""
+    game_start_time = event.get("game_start_time")
+
+    # Default timestamp (epoch) for missing or invalid dates
+    timestamp = 0
+
+    if game_start_time:
+        try:
+            # Parse Excel-friendly format: "YYYY-MM-DD HH:MM:SS"
+            dt = datetime.fromisoformat(game_start_time.replace(" ", "T"))
+            timestamp = int(dt.timestamp())
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Invalid game_start_time format '{game_start_time}' for event {event.get('event_id', 'unknown')}: {e}")
+            # Use epoch timestamp (0) as fallback
+
+    # Return negative timestamp for descending order (newest first)
+    return (sport, -timestamp)
 
 
 def save_to_csv(flattened_events, filename):
@@ -700,8 +816,12 @@ def save_to_csv(flattened_events, filename):
         "volume",                                                 # Trading
     ]
 
+    # Ensure parent directory exists
+    filepath = Path(filename)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
     # Write CSV with proper formatting (QUOTE_MINIMAL avoids quoting numbers)
-    with open(filename, "w", newline="", encoding="utf-8") as csvfile:
+    with open(filepath, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(
             csvfile,
             fieldnames=fieldnames,
@@ -729,24 +849,29 @@ def main():
 
         all_flattened = []
 
-        for tag_id, sport_codes in SPORTS_TO_FETCH:
-            sport_label = "/".join(sport_codes).upper()
-            print(f"\nFetching {sport_label} events (tag {tag_id})...")
+        sports_pbar = tqdm(
+            SPORTS_TO_FETCH,
+            desc="Processing sports",
+            unit="sport",
+            leave=True,
+            colour='blue'
+        )
 
-            events = fetch_all_events(tag_id)
-            print(f"Found {len(events)} {sport_label} events from {MIN_YEAR}+")
+        for tag_id, sport_codes in sports_pbar:
+            sport_label = "/".join(sport_codes).upper()
+            sports_pbar.set_description(f"Sport: {sport_label}")
+
+            events = fetch_all_events(tag_id, sport_label)
 
             if events:
                 # Process events for this sport
-                print(f"Processing {sport_label} events...")
-                # === NEW: Pass clob_markets to processing ===
-                flattened = asyncio.run(process_events_async(events, tag_id, clob_markets))
+                # === NEW: Pass clob_markets and sport_label to processing ===
+                flattened = asyncio.run(process_events_async(events, tag_id, clob_markets, sport_label))
                 # === END NEW ===
                 all_flattened.extend(flattened)
-                print(f"Processed {len(flattened)} {sport_label} moneyline events")
 
         # Sort by sport first, then by game_start_time (recent to old)
-        all_flattened.sort(key=lambda x: (x.get("sport") or "", -(int(datetime.fromisoformat((x.get("game_start_time") or "1970-01-01 00:00:00").replace(" ", "T")).timestamp()) if x.get("game_start_time") else 0)))
+        all_flattened.sort(key=get_sort_key)
 
         # Write combined CSV
         print(f"\nWriting {len(all_flattened)} total events to {OUTPUT_FILE}...")

@@ -1,8 +1,21 @@
-aiohttp
-requests
-tqdm
-py-clob-client>=0.17.4
-pandas
-matplotlib
-pytest>=7.0.0
-pytest-cov>=4.0.0
+# Data Processing
+pandas==2.3.3              # DataFrame operations, CSV I/O
+numpy==2.3.5               # Pandas dependency
+
+# Visualization
+matplotlib==3.10.8         # Chart generation
+pillow==12.0.0             # Matplotlib dependency for PNG output
+
+# HTTP Clients
+aiohttp==3.12.15           # Async HTTP for price fetching
+requests==2.32.5           # Sync HTTP for Gamma API
+
+# Polymarket SDK
+py_clob_client>=0.17.4     # CLOB API wrapper (markets, token IDs)
+
+# Progress Bars
+tqdm==4.67.1               # Terminal progress indicators
+
+# Development Dependencies
+pytest>=7.0.0              # Test framework
+pytest-cov>=4.0.0          # Coverage reporting
