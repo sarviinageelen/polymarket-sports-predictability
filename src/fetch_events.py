@@ -5,9 +5,10 @@ Fetch sports moneyline events from Polymarket API and save to CSV.
 Supports multiple sports: ATP, WTA, NBA, NFL, MLB, CFB, NCAAB
 
 Optimized version with:
-- Async/await with aiohttp for concurrent CLOB API price fetching
-- Connection pooling for gamma-api requests
-- Smart rate limiting with exponential backoff
+- Fully async pipeline with aiohttp for all API calls
+- Concurrent fetching of all sports (not sequential)
+- Smart rate limiting with semaphores and exponential backoff retry
+- Comprehensive error tracking with detailed quality report
 - Excel-friendly CSV formatting
 - 2025 events only for better data completeness
 """
@@ -17,22 +18,40 @@ import csv
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Lock
+from typing import Any
 
 import aiohttp
-import requests
 from tqdm import tqdm
 
 from fetch_sports import SPORT_CATEGORIES, fetch_sports_data
 
-# Configure logging - changed to INFO to see debug messages
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+
+class TqdmLoggingHandler(logging.StreamHandler):
+    """Logging handler that integrates with tqdm progress bars.
+
+    Routes log output through tqdm.write() which automatically pauses
+    progress bars before writing, then resumes them cleanly.
+    """
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+        except Exception:
+            self.handleError(record)
+
+
+# Configure logging with tqdm-aware handler for clean progress bar display
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = TqdmLoggingHandler()
+handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+))
+logger.addHandler(handler)
 
 
 API_URL = "https://gamma-api.polymarket.com/events"
@@ -43,6 +62,11 @@ PROJECT_ROOT = Path(__file__).parent.parent
 OUTPUT_FILE = PROJECT_ROOT / "data" / "fetch_events.csv"
 PAGE_SIZE = 100
 MAX_WORKERS = 8  # Number of concurrent async tasks for event processing
+
+# Gamma API concurrency configuration
+GAMMA_MAX_CONCURRENT = 3  # Max concurrent gamma API requests across all sports
+GAMMA_PAGE_DELAY = 0.1    # Small delay between pages to avoid hammering API
+GAMMA_MAX_RETRIES = 3     # Max retries per request with exponential backoff
 
 # CLOB API configuration for reliable token IDs and market data
 CLOB_HOST = "https://clob.polymarket.com"
@@ -63,11 +87,63 @@ SPORTS_TO_FETCH = [
 # Minimum year for events (filter out older data with incomplete price history)
 MIN_YEAR = 2025
 
-# Connection pooling for gamma-api requests
-SESSION = requests.Session()
-
 # Cached tag-to-sport mapping (populated at runtime)
 _tag_to_sport_map = None
+
+
+@dataclass
+class FetchError:
+    """Represents a single fetch failure."""
+    source: str       # "gamma" or "price"
+    identifier: str   # sport label or token_id
+    page: int         # page number (0 for price fetches)
+    error_type: str   # "timeout", "http_429", "http_500", "network", etc.
+    message: str
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class ErrorTracker:
+    """Tracks all fetch failures for quality reporting."""
+    gamma_errors: list = field(default_factory=list)
+    price_errors: list = field(default_factory=list)
+
+    # Counters for summary
+    gamma_pages_attempted: int = 0
+    gamma_pages_succeeded: int = 0
+    price_fetches_attempted: int = 0
+    price_fetches_succeeded: int = 0
+
+    def add_gamma_error(self, sport: str, page: int, error_type: str, message: str):
+        """Record a gamma API fetch failure."""
+        self.gamma_errors.append(FetchError("gamma", sport, page, error_type, message))
+
+    def add_price_error(self, token_id: str, error_type: str, message: str):
+        """Record a price history fetch failure."""
+        self.price_errors.append(FetchError("price", token_id[:16] if token_id else "unknown", 0, error_type, message))
+
+    def get_summary(self) -> dict:
+        """Generate summary statistics for quality report."""
+        return {
+            "gamma_success_rate": (
+                self.gamma_pages_succeeded / self.gamma_pages_attempted * 100
+                if self.gamma_pages_attempted > 0 else 100.0
+            ),
+            "gamma_errors_by_type": self._count_by_type(self.gamma_errors),
+            "price_success_rate": (
+                self.price_fetches_succeeded / self.price_fetches_attempted * 100
+                if self.price_fetches_attempted > 0 else 100.0
+            ),
+            "price_errors_by_type": self._count_by_type(self.price_errors),
+            "total_gamma_errors": len(self.gamma_errors),
+            "total_price_errors": len(self.price_errors),
+        }
+
+    def _count_by_type(self, errors: list) -> dict:
+        counts: dict[str, int] = {}
+        for e in errors:
+            counts[e.error_type] = counts.get(e.error_type, 0) + 1
+        return counts
 
 
 def build_tag_to_sport_mapping():
@@ -224,46 +300,72 @@ def determine_sport_for_event(event, tag_id):
     # Default to first match
     return matches[0]
 
-# Rate limiting state
-_rate_limit_lock = Lock()
-_backoff_until = 0
+async def fetch_with_retry(
+    session: aiohttp.ClientSession,
+    url: str,
+    params: dict,
+    max_retries: int = GAMMA_MAX_RETRIES,
+    base_delay: float = 1.0,
+) -> tuple[Any | None, bool, str | None]:
+    """Generic async fetch with exponential backoff retry.
 
+    Args:
+        session: aiohttp client session
+        url: API endpoint URL
+        params: Query parameters
+        max_retries: Maximum retry attempts
+        base_delay: Base delay for exponential backoff (seconds)
 
-def _wait_for_rate_limit():
-    """Wait if we're in a backoff period.
-
-    Thread-safe: Only holds lock for reading backoff time, not during sleep.
-    This prevents blocking other threads unnecessarily.
+    Returns:
+        tuple of (response_json, success, error_message)
     """
-    global _backoff_until
+    retry_statuses = {429, 500, 502, 503, 504}
+    last_error = None
 
-    # Read backoff time inside lock (fast operation)
-    with _rate_limit_lock:
-        now = time.time()
-        sleep_time = max(0, _backoff_until - now)
+    for attempt in range(max_retries):
+        try:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    return await response.json(), True, None
 
-    # Sleep OUTSIDE lock to avoid blocking other threads
-    if sleep_time > 0:
-        time.sleep(sleep_time)
+                if response.status in retry_statuses:
+                    # Get Retry-After header if present (for 429)
+                    retry_after = response.headers.get("Retry-After")
+                    wait_time = float(retry_after) if retry_after else (base_delay * (2 ** attempt))
 
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"API returned {response.status}, "
+                            f"retrying in {wait_time:.1f}s (attempt {attempt+1}/{max_retries})"
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
 
-def _handle_rate_limit(response):
-    """Handle 429 rate limit response with exponential backoff."""
-    global _backoff_until
-    if response.status_code == 429:
-        with _rate_limit_lock:
-            # Exponential backoff: wait 1-2 seconds
-            wait_time = float(response.headers.get("Retry-After", 1))
-            new_backoff = time.time() + wait_time
-            # Only update if this extends the backoff period
-            if new_backoff > _backoff_until:
-                _backoff_until = new_backoff
-            # Sleep for the remaining backoff time
-            sleep_duration = _backoff_until - time.time()
-        if sleep_duration > 0:
-            time.sleep(sleep_duration)
-        return True
-    return False
+                # Non-retryable error or final retry failed
+                last_error = f"HTTP_{response.status}"
+                return None, False, last_error
+
+        except aiohttp.ClientError as e:
+            last_error = f"network_{type(e).__name__}"
+            if attempt < max_retries - 1:
+                wait_time = base_delay * (2 ** attempt)
+                logger.warning(f"Network error: {e}, retrying in {wait_time:.1f}s")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Request failed after {max_retries} attempts: {e}")
+                return None, False, last_error
+
+        except asyncio.TimeoutError:
+            last_error = "timeout"
+            if attempt < max_retries - 1:
+                wait_time = base_delay * (2 ** attempt)
+                logger.warning(f"Timeout, retrying in {wait_time:.1f}s")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Timeout after {max_retries} attempts")
+                return None, False, last_error
+
+    return None, False, last_error
 
 
 def format_date_for_excel(iso_date_str):
@@ -288,48 +390,115 @@ def is_2025_or_later(date_str):
         return False
 
 
-def fetch_events_page(tag_id, offset=0):
-    """Fetch a single page of events for a given tag_id."""
-    params = {
-        "tag_id": tag_id,
-        "limit": PAGE_SIZE,
-        "offset": offset,
-    }
-    _wait_for_rate_limit()
-    response = SESSION.get(API_URL, params=params)
-    if _handle_rate_limit(response):
-        response = SESSION.get(API_URL, params=params)
-    response.raise_for_status()
-    return response.json()
+async def fetch_all_events_async(
+    session: aiohttp.ClientSession,
+    tag_id: int,
+    sport_label: str,
+    gamma_semaphore: asyncio.Semaphore,
+    error_tracker: ErrorTracker,
+) -> list[dict]:
+    """Fetch all events for a tag_id with pagination, filtered to 2025+.
 
-
-def fetch_all_events(tag_id, sport_label="Unknown"):
-    """Fetch all events for a tag_id with pagination, filtered to 2025+."""
+    Uses semaphore for rate limiting across concurrent sport fetches.
+    """
     all_events = []
     offset = 0
+    page_num = 0
 
-    with tqdm(
-        desc=f"Fetching {sport_label} events",
-        unit="pages",
-        leave=False,
-        mininterval=0.5
-    ) as pbar:
-        while True:
-            events = fetch_events_page(tag_id, offset)
+    while True:
+        # Acquire semaphore to limit concurrent gamma requests
+        async with gamma_semaphore:
+            error_tracker.gamma_pages_attempted += 1
 
-            if not events:
-                break
+            data, success, error_msg = await fetch_with_retry(
+                session=session,
+                url=API_URL,
+                params={"tag_id": tag_id, "limit": PAGE_SIZE, "offset": offset}
+            )
 
-            # Filter to 2025+ events only
-            for event in events:
-                start_date = event.get("startDate", "")
-                if is_2025_or_later(start_date):
-                    all_events.append(event)
+            if not success:
+                error_tracker.add_gamma_error(
+                    sport=sport_label,
+                    page=page_num,
+                    error_type=error_msg or "unknown",
+                    message=f"Failed to fetch page {page_num} for {sport_label}"
+                )
+                # Continue to next page - don't fail entire sport
+                offset += PAGE_SIZE
+                page_num += 1
+                # Small delay before retry to avoid hammering on errors
+                await asyncio.sleep(GAMMA_PAGE_DELAY * 2)
+                continue
 
-            offset += PAGE_SIZE
-            pbar.update(1)
+            error_tracker.gamma_pages_succeeded += 1
 
+        events = data if isinstance(data, list) else []
+
+        if not events:
+            break
+
+        # Filter to 2025+ events only
+        for event in events:
+            start_date = event.get("startDate", "")
+            if is_2025_or_later(start_date):
+                all_events.append(event)
+
+        offset += PAGE_SIZE
+        page_num += 1
+
+        # Small delay between pages to be API-friendly
+        await asyncio.sleep(GAMMA_PAGE_DELAY)
+
+    logger.info(f"Fetched {len(all_events)} {sport_label} events from {page_num} pages")
     return all_events
+
+
+async def fetch_all_sports_events_async(
+    session: aiohttp.ClientSession,
+    sports_to_fetch: list[tuple[int, list[str]]],
+    gamma_semaphore: asyncio.Semaphore,
+    error_tracker: ErrorTracker,
+) -> dict[int, tuple[list[dict], str]]:
+    """Fetch events for ALL sports concurrently.
+
+    Returns dict mapping tag_id -> (events_list, sport_label).
+    """
+
+    async def fetch_sport(tag_id: int, sport_codes: list[str]) -> tuple[int, list[dict], str]:
+        """Wrapper to fetch one sport and return with its tag_id."""
+        sport_label = "/".join(sport_codes).upper()
+        events = await fetch_all_events_async(
+            session=session,
+            tag_id=tag_id,
+            sport_label=sport_label,
+            gamma_semaphore=gamma_semaphore,
+            error_tracker=error_tracker
+        )
+        return tag_id, events, sport_label
+
+    # Create tasks for all sports
+    tasks = [
+        fetch_sport(tag_id, sport_codes)
+        for tag_id, sport_codes in sports_to_fetch
+    ]
+
+    # Progress bar for sports
+    results: dict[int, tuple[list[dict], str]] = {}
+    with tqdm(
+        total=len(tasks),
+        desc="Fetching all sports",
+        unit="sport",
+        colour='blue'
+    ) as pbar:
+        # Use as_completed for real-time progress updates
+        for coro in asyncio.as_completed(tasks):
+            tag_id, events, sport_label = await coro
+            results[tag_id] = (events, sport_label)
+            total_events = sum(len(e[0]) for e in results.values())
+            pbar.update(1)
+            pbar.set_postfix(events=total_events)
+
+    return results
 
 
 async def fetch_price_history(session, token_id, start_ts, end_ts):
@@ -635,18 +804,17 @@ async def process_event(session, event, tag_id, clob_markets, price_stats=None):
         logger.error(f"Empty token IDs for condition {condition_id} - skipping")
         return None
 
-    # Basic format validation: token IDs should be hex strings (0x followed by hex digits)
-    # Typical format: "0x1234567890abcdef..."
+    # Token IDs are large integers stored as decimal numeric strings
+    # Typical format: "73470541315377973562501025254719659..."
     if not (isinstance(token_id_1, str) and isinstance(token_id_2, str)):
         logger.error(f"Invalid token ID types for condition {condition_id}: {type(token_id_1)}, {type(token_id_2)}")
         return None
 
-    if not (token_id_1.startswith("0x") and token_id_2.startswith("0x")):
+    if not (token_id_1.isdigit() and token_id_2.isdigit()):
         logger.warning(
-            f"Token IDs for condition {condition_id} don't start with '0x': "
+            f"Token IDs for condition {condition_id} are not numeric strings: "
             f"token_1={token_id_1[:20]}..., token_2={token_id_2[:20]}..."
         )
-        # Continue anyway - format may have changed
 
     if len(token_id_1) < 10 or len(token_id_2) < 10:
         logger.warning(
@@ -733,10 +901,18 @@ async def process_event(session, event, tag_id, clob_markets, price_stats=None):
     }
 
 
-async def process_events_async(events, tag_id, clob_markets, sport_label="Unknown"):
+async def process_events_async(
+    session: aiohttp.ClientSession,
+    events: list[dict],
+    tag_id: int,
+    clob_markets: dict,
+    error_tracker: ErrorTracker,
+    sport_label: str = "Unknown",
+):
     """Process all events concurrently with semaphore for rate limiting.
 
     Now requires clob_markets dict for enriching events with reliable CLOB data.
+    Uses shared session and tracks errors.
     """
     semaphore = asyncio.Semaphore(MAX_WORKERS)
     results = []
@@ -744,31 +920,79 @@ async def process_events_async(events, tag_id, clob_markets, sport_label="Unknow
     # Track price API calls
     price_stats = {"fetched": 0, "total": len(events) * 2}
 
-    async with aiohttp.ClientSession() as session:
-        async def process_with_semaphore(event):
-            async with semaphore:
-                return await process_event(session, event, tag_id, clob_markets, price_stats)
+    async def process_with_semaphore(event):
+        async with semaphore:
+            error_tracker.price_fetches_attempted += 2  # Two prices per event
+            result = await process_event(session, event, tag_id, clob_markets, price_stats)
+            if result and result.get("p1_close") is not None:
+                error_tracker.price_fetches_succeeded += 1
+            if result and result.get("p2_close") is not None:
+                error_tracker.price_fetches_succeeded += 1
+            return result
 
-        # Create tasks for all events
-        tasks = [process_with_semaphore(event) for event in events]
+    # Create tasks for all events
+    tasks = [process_with_semaphore(event) for event in events]
 
-        # Process with progress bar
-        with tqdm(
-            total=len(tasks),
-            desc=f"Processing {sport_label}",
-            unit="events",
-            leave=False,
-            mininterval=0.5,
-            postfix={"prices": f"0/{price_stats['total']}"}
-        ) as pbar:
-            for coro in asyncio.as_completed(tasks):
-                result = await coro
-                if result is not None:
-                    results.append(result)
-                pbar.set_postfix(prices=f"{price_stats['fetched']}/{price_stats['total']}")
-                pbar.update(1)
+    # Process with progress bar
+    with tqdm(
+        total=len(tasks),
+        desc=f"Processing {sport_label}",
+        unit="events",
+        leave=False,
+        mininterval=0.5,
+        postfix={"prices": f"0/{price_stats['total']}"}
+    ) as pbar:
+        for coro in asyncio.as_completed(tasks):
+            result = await coro
+            if result is not None:
+                results.append(result)
+            pbar.set_postfix(prices=f"{price_stats['fetched']}/{price_stats['total']}")
+            pbar.update(1)
 
     return results
+
+
+async def process_all_sports_async(
+    session: aiohttp.ClientSession,
+    sports_events: dict[int, tuple[list[dict], str]],
+    clob_markets: dict,
+    error_tracker: ErrorTracker,
+) -> list[dict]:
+    """Process events for all sports concurrently.
+
+    Args:
+        session: Shared aiohttp session
+        sports_events: Dict mapping tag_id -> (events_list, sport_label)
+        clob_markets: CLOB market data for enrichment
+        error_tracker: Tracks errors for quality report
+
+    Returns:
+        Combined list of all processed events
+    """
+    all_flattened = []
+
+    # Process all sports concurrently
+    async def process_sport(tag_id: int, events: list[dict], sport_label: str) -> list[dict]:
+        return await process_events_async(
+            session=session,
+            events=events,
+            tag_id=tag_id,
+            clob_markets=clob_markets,
+            error_tracker=error_tracker,
+            sport_label=sport_label,
+        )
+
+    tasks = [
+        process_sport(tag_id, events, sport_label)
+        for tag_id, (events, sport_label) in sports_events.items()
+    ]
+
+    # Gather all results
+    results_list = await asyncio.gather(*tasks)
+    for results in results_list:
+        all_flattened.extend(results)
+
+    return all_flattened
 
 
 def get_sort_key(event):
@@ -834,107 +1058,150 @@ def save_to_csv(flattened_events, filename):
     print(f"Saved {len(flattened_events)} moneyline events to {filename}")
 
 
-def main():
-    """Main entry point."""
-    try:
-        # Load sports metadata first for category/sport classification
-        print("Loading sports metadata...")
-        get_tag_to_sport_map()
+def print_data_quality_report(all_flattened: list[dict], error_tracker: ErrorTracker):
+    """Print enhanced data quality report including fetch error statistics."""
+    print("\n" + "=" * 60)
+    print("DATA QUALITY REPORT")
+    print("=" * 60)
 
-        # === NEW: Fetch CLOB markets ONCE at start ===
-        print("\nFetching CLOB markets...")
-        clob_markets = asyncio.run(fetch_clob_markets_async())
-        print(f"Loaded {len(clob_markets)} CLOB markets")
-        # === END NEW ===
+    total_events = len(all_flattened)
+    closed_events = sum(1 for e in all_flattened if e.get("closed") == 1)
 
-        all_flattened = []
+    # Count events with closing prices
+    has_prices = sum(
+        1 for e in all_flattened
+        if e.get("p1_close") is not None and e.get("p2_close") is not None
+    )
 
-        sports_pbar = tqdm(
-            SPORTS_TO_FETCH,
-            desc="Processing sports",
-            unit="sport",
-            leave=True,
-            colour='blue'
-        )
+    # Count closed events with closing prices
+    closed_with_prices = sum(
+        1 for e in all_flattened
+        if e.get("closed") == 1
+        and e.get("p1_close") is not None
+        and e.get("p2_close") is not None
+    )
 
-        for tag_id, sport_codes in sports_pbar:
-            sport_label = "/".join(sport_codes).upper()
-            sports_pbar.set_description(f"Sport: {sport_label}")
+    # Count events with winners
+    has_winner = sum(1 for e in all_flattened if e.get("winner"))
 
-            events = fetch_all_events(tag_id, sport_label)
+    print(f"Total events:              {total_events:>6}")
+    print(f"Closed events:             {closed_events:>6} ({100*closed_events/total_events if total_events > 0 else 0:.1f}%)")
+    print(f"Events with prices:        {has_prices:>6} ({100*has_prices/total_events if total_events > 0 else 0:.1f}%)")
+    print(f"Closed with prices:        {closed_with_prices:>6} ({100*closed_with_prices/closed_events if closed_events > 0 else 0:.1f}% of closed)")
+    print(f"Events with winner:        {has_winner:>6} ({100*has_winner/closed_events if closed_events > 0 else 0:.1f}% of closed)")
+    print(f"\nData completeness:         {100*closed_with_prices/closed_events if closed_events > 0 else 0:.1f}% ← TARGET: >90%")
 
-            if events:
-                # Process events for this sport
-                # === NEW: Pass clob_markets and sport_label to processing ===
-                flattened = asyncio.run(process_events_async(events, tag_id, clob_markets, sport_label))
-                # === END NEW ===
-                all_flattened.extend(flattened)
+    # === FETCH ERROR SUMMARY ===
+    print("\n" + "-" * 60)
+    print("FETCH ERROR SUMMARY")
+    print("-" * 60)
 
-        # Sort by sport first, then by game_start_time (recent to old)
-        all_flattened.sort(key=get_sort_key)
+    summary = error_tracker.get_summary()
 
-        # Write combined CSV
-        print(f"\nWriting {len(all_flattened)} total events to {OUTPUT_FILE}...")
-        save_to_csv(all_flattened, OUTPUT_FILE)
+    print(f"Gamma API pages attempted: {error_tracker.gamma_pages_attempted:>6}")
+    print(f"Gamma API pages succeeded: {error_tracker.gamma_pages_succeeded:>6} ({summary['gamma_success_rate']:.1f}%)")
+    print(f"Gamma API errors:          {summary['total_gamma_errors']:>6}")
 
-        # === NEW: DATA QUALITY METRICS ===
-        print("\n" + "=" * 60)
-        print("DATA QUALITY REPORT")
-        print("=" * 60)
+    if summary['gamma_errors_by_type']:
+        print("  By type:")
+        for error_type, count in sorted(summary['gamma_errors_by_type'].items()):
+            print(f"    - {error_type}: {count}")
 
-        total_events = len(all_flattened)
-        closed_events = sum(1 for e in all_flattened if e.get("closed") == 1)
+    print(f"\nPrice API fetches attempted: {error_tracker.price_fetches_attempted:>6}")
+    print(f"Price API fetches succeeded: {error_tracker.price_fetches_succeeded:>6} ({summary['price_success_rate']:.1f}%)")
+    print(f"Price API errors:            {summary['total_price_errors']:>6}")
 
-        # Count events with closing prices
-        has_prices = sum(
-            1 for e in all_flattened
-            if e.get("p1_close") is not None and e.get("p2_close") is not None
-        )
+    if summary['price_errors_by_type']:
+        print("  By type:")
+        for error_type, count in sorted(summary['price_errors_by_type'].items()):
+            print(f"    - {error_type}: {count}")
 
-        # Count closed events with closing prices
-        closed_with_prices = sum(
-            1 for e in all_flattened
+    print("=" * 60)
+
+    # Per-sport breakdown
+    print("\nPer-Sport Breakdown:")
+    print(f"{'Sport':<20} {'Total':>8} {'Closed':>8} {'With Prices':>12} {'Completeness':>12}")
+    print("-" * 65)
+
+    sports = set(e.get("sport") for e in all_flattened)
+    for sport in sorted(sports):
+        sport_events = [e for e in all_flattened if e.get("sport") == sport]
+        sport_total = len(sport_events)
+        sport_closed = sum(1 for e in sport_events if e.get("closed") == 1)
+        sport_prices = sum(
+            1 for e in sport_events
             if e.get("closed") == 1
             and e.get("p1_close") is not None
             and e.get("p2_close") is not None
         )
+        completeness = 100 * sport_prices / sport_closed if sport_closed > 0 else 0
 
-        # Count events with winners
-        has_winner = sum(1 for e in all_flattened if e.get("winner"))
+        print(f"{sport.upper():<20} {sport_total:>8} {sport_closed:>8} {sport_prices:>12} {completeness:>11.1f}%")
 
-        print(f"Total events:              {total_events:>6}")
-        print(f"Closed events:             {closed_events:>6} ({100*closed_events/total_events if total_events > 0 else 0:.1f}%)")
-        print(f"Events with prices:        {has_prices:>6} ({100*has_prices/total_events if total_events > 0 else 0:.1f}%)")
-        print(f"Closed with prices:        {closed_with_prices:>6} ({100*closed_with_prices/closed_events if closed_events > 0 else 0:.1f}% of closed)")
-        print(f"Events with winner:        {has_winner:>6} ({100*has_winner/closed_events if closed_events > 0 else 0:.1f}% of closed)")
-        print(f"\nData completeness:         {100*closed_with_prices/closed_events if closed_events > 0 else 0:.1f}% ← TARGET: >90%")
-        print("=" * 60)
+    print("=" * 60)
 
-        # Per-sport breakdown
-        print("\nPer-Sport Breakdown:")
-        print(f"{'Sport':<20} {'Total':>8} {'Closed':>8} {'With Prices':>12} {'Completeness':>12}")
-        print("-" * 65)
 
-        sports = set(e.get("sport") for e in all_flattened)
-        for sport in sorted(sports):
-            sport_events = [e for e in all_flattened if e.get("sport") == sport]
-            sport_total = len(sport_events)
-            sport_closed = sum(1 for e in sport_events if e.get("closed") == 1)
-            sport_prices = sum(
-                1 for e in sport_events
-                if e.get("closed") == 1
-                and e.get("p1_close") is not None
-                and e.get("p2_close") is not None
-            )
-            completeness = 100 * sport_prices / sport_closed if sport_closed > 0 else 0
+async def main_async():
+    """Main async entry point - single event loop for entire operation."""
+    # Initialize error tracking
+    error_tracker = ErrorTracker()
 
-            print(f"{sport.upper():<20} {sport_total:>8} {sport_closed:>8} {sport_prices:>12} {completeness:>11.1f}%")
+    # Initialize concurrency controls
+    gamma_semaphore = asyncio.Semaphore(GAMMA_MAX_CONCURRENT)
 
-        print("=" * 60)
-        # === END DATA QUALITY METRICS ===
+    # Load sports metadata first (sync, fast)
+    print("Loading sports metadata...")
+    get_tag_to_sport_map()
 
-    except requests.RequestException as e:
-        print(f"Error fetching data: {e}")
+    # Create shared aiohttp session with timeout
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+
+        # Fetch CLOB markets (async)
+        print("\nFetching CLOB markets...")
+        clob_markets = await fetch_clob_markets_async()
+        print(f"Loaded {len(clob_markets)} CLOB markets")
+
+        # Fetch ALL sports events CONCURRENTLY
+        print("\nFetching events for all sports concurrently...")
+        sports_events = await fetch_all_sports_events_async(
+            session=session,
+            sports_to_fetch=SPORTS_TO_FETCH,
+            gamma_semaphore=gamma_semaphore,
+            error_tracker=error_tracker
+        )
+
+        total_events = sum(len(events) for events, _ in sports_events.values())
+        print(f"Fetched {total_events} total events across {len(sports_events)} sports")
+
+        # Process all events for all sports
+        print("\nProcessing events and fetching prices...")
+        all_flattened = await process_all_sports_async(
+            session=session,
+            sports_events=sports_events,
+            clob_markets=clob_markets,
+            error_tracker=error_tracker
+        )
+
+    # Sort and save (sync)
+    all_flattened.sort(key=get_sort_key)
+    print(f"\nWriting {len(all_flattened)} total events to {OUTPUT_FILE}...")
+    save_to_csv(all_flattened, OUTPUT_FILE)
+
+    # Data quality report with error tracking
+    print_data_quality_report(all_flattened, error_tracker)
+
+
+def main():
+    """Synchronous entry point - wraps async main."""
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+        raise SystemExit(1)
+    except Exception as e:
+        logger.error(f"Pipeline failed: {e}")
+        print(f"Error: {e}")
         raise SystemExit(1)
 
 
