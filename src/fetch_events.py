@@ -61,11 +61,11 @@ PRICES_API_URL = "https://clob.polymarket.com/prices-history"
 PROJECT_ROOT = Path(__file__).parent.parent
 OUTPUT_FILE = PROJECT_ROOT / "data" / "fetch_events.csv"
 PAGE_SIZE = 100
-MAX_WORKERS = 8  # Number of concurrent async tasks for event processing
+MAX_WORKERS = 2  # Number of concurrent async tasks for price fetching (reduced to avoid 429s)
 
 # Gamma API concurrency configuration
-GAMMA_MAX_CONCURRENT = 3  # Max concurrent gamma API requests across all sports
-GAMMA_PAGE_DELAY = 0.1    # Small delay between pages to avoid hammering API
+GAMMA_MAX_CONCURRENT = 10  # Max concurrent gamma API requests across all sports
+GAMMA_PAGE_DELAY = 0.05   # Small delay between pages (reduced - Gamma API rarely rate-limits)
 GAMMA_MAX_RETRIES = 3     # Max retries per request with exponential backoff
 
 # CLOB API configuration for reliable token IDs and market data
@@ -334,7 +334,7 @@ async def fetch_with_retry(
                     wait_time = float(retry_after) if retry_after else (base_delay * (2 ** attempt))
 
                     if attempt < max_retries - 1:
-                        logger.warning(
+                        logger.debug(
                             f"API returned {response.status}, "
                             f"retrying in {wait_time:.1f}s (attempt {attempt+1}/{max_retries})"
                         )
@@ -349,20 +349,20 @@ async def fetch_with_retry(
             last_error = f"network_{type(e).__name__}"
             if attempt < max_retries - 1:
                 wait_time = base_delay * (2 ** attempt)
-                logger.warning(f"Network error: {e}, retrying in {wait_time:.1f}s")
+                logger.debug(f"Network error: {e}, retrying in {wait_time:.1f}s")
                 await asyncio.sleep(wait_time)
             else:
-                logger.error(f"Request failed after {max_retries} attempts: {e}")
+                logger.debug(f"Request failed after {max_retries} attempts: {e}")
                 return None, False, last_error
 
         except asyncio.TimeoutError:
             last_error = "timeout"
             if attempt < max_retries - 1:
                 wait_time = base_delay * (2 ** attempt)
-                logger.warning(f"Timeout, retrying in {wait_time:.1f}s")
+                logger.debug(f"Timeout, retrying in {wait_time:.1f}s")
                 await asyncio.sleep(wait_time)
             else:
-                logger.error(f"Timeout after {max_retries} attempts")
+                logger.debug(f"Timeout after {max_retries} attempts")
                 return None, False, last_error
 
     return None, False, last_error
@@ -520,7 +520,7 @@ async def fetch_price_history(session, token_id, start_ts, end_ts):
                 logger.debug(f"Fetched {len(history)} price points for token {token_id[:8]}...")
                 return history
             else:
-                logger.warning(f"Price API returned {response.status} for token {token_id[:8]}...")
+                logger.debug(f"Price API returned {response.status} for token {token_id[:8]}...")
                 return []
     except Exception as e:
         logger.error(f"Price fetch exception for token {token_id[:8]}...: {e}")
@@ -544,16 +544,16 @@ async def fetch_price_history_with_retry(session, token_id, start_ts, end_ts, ma
                 logger.debug(f"Empty result for token {token_id[:8]}..., retrying in {wait_time}s (attempt {attempt+1}/{max_retries})")
                 await asyncio.sleep(wait_time)
             else:
-                logger.warning(f"Failed to fetch prices for token {token_id[:8]}... after {max_retries} attempts")
+                logger.debug(f"Failed to fetch prices for token {token_id[:8]}... after {max_retries} attempts")
                 return []
 
         except Exception as e:
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
-                logger.warning(f"Price fetch error for token {token_id[:8]}...: {e}, retrying in {wait_time}s")
+                logger.debug(f"Price fetch error for token {token_id[:8]}...: {e}, retrying in {wait_time}s")
                 await asyncio.sleep(wait_time)
             else:
-                logger.error(f"Failed to fetch prices for token {token_id[:8]}... after {max_retries} attempts: {e}")
+                logger.debug(f"Failed to fetch prices for token {token_id[:8]}... after {max_retries} attempts: {e}")
                 return []
 
     return []
@@ -658,7 +658,7 @@ async def get_closing_prices(session, token_id_1, token_id_2, condition_id, game
 
     # Debug logging for empty histories
     if not history_1 or not history_2:
-        logger.warning(
+        logger.debug(
             f"Price fetch failed for condition {condition_id}: "
             f"token_1={token_id_1[:8]}... (len={len(history_1)}), "
             f"token_2={token_id_2[:8]}... (len={len(history_2)})"
