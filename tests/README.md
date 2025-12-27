@@ -11,7 +11,7 @@ python -m pytest tests/
 
 ### Run specific test file
 ```bash
-python -m pytest tests/test_generate_chart.py
+python -m pytest tests/test_generate_chart.py  # Tests for generate_insights.py
 ```
 
 ### Run with coverage
@@ -26,7 +26,7 @@ python -m pytest tests/ -v
 
 ## Test Structure
 
-- `test_generate_chart.py` - Tests for chart generation and favorite win rate calculations
+- `test_generate_chart.py` - Tests for insights generation and favorite win rate calculations
 - `test_fetch_sports.py` - Tests for sports metadata handling
 - `test_integration.py` - Integration tests for the full pipeline
 

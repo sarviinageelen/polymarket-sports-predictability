@@ -29,7 +29,7 @@ The analysis processes 7,141 closed betting markets across seven sports (ATP, WT
 
 The system implements a multi-stage data pipeline integrating two Polymarket APIs:
 
-```
+```text
 ┌──────────────────┐
 │   Gamma API      │  Sport-based event filtering via tag IDs
 │  (Event Catalog) │  Fetches: event metadata, participants, market structure
@@ -99,13 +99,13 @@ python src/fetch_events.py
 
 **Output**: `data/fetch_events.csv` (60-90 minutes for 7,141 events)
 
-### Step 3: Generate Analysis
+### Step 3: Generate Insights
 
 ```bash
-python src/generate_chart.py
+python src/generate_insights.py
 ```
 
-**Output**: `outputs/favourite_win_rates.png` (~2 seconds)
+**Output**: `outputs/favourite_win_rates.xlsx` (7 focused tabs with actionable betting insights)
 
 ## API Integration
 
@@ -118,18 +118,25 @@ The hybrid approach resolves Gamma API's 89% missing price data by matching even
 
 ## Output Structure
 
-```
+```text
 data/
 ├── fetch_events.csv    # 7,141 events with pricing and settlement
 └── fetch_sports.csv    # Sports metadata and tag mappings
 
 outputs/
-└── favourite_win_rates.png    # Win rate visualization (1920×1080)
+└── favourite_win_rates.xlsx    # Excel workbook with 7 tabs:
+    ├── Index                   # Overview + key takeaways
+    ├── Quick Reference         # Top actionable strategies
+    ├── Sport Guide             # Which sports to bet
+    ├── Underdog Opportunities  # ROI by sport/threshold
+    ├── Reliable Favorites      # Best teams when favored
+    ├── Market Efficiency       # Calibration analysis
+    └── Raw Data                # Summary statistics
 ```
 
 ## Project Structure
 
-```
+```text
 polymarket-sports-predictability/
 ├── README.md
 ├── LICENSE
@@ -137,13 +144,13 @@ polymarket-sports-predictability/
 ├── src/
 │   ├── fetch_sports.py      # Sports metadata fetcher
 │   ├── fetch_events.py      # Event data pipeline
-│   └── generate_chart.py    # Win rate analysis
+│   └── generate_insights.py # Betting insights analysis
 ├── tests/
 │   ├── test_fetch_sports.py
 │   ├── test_generate_chart.py
 │   └── test_integration.py
 ├── data/                    # Generated datasets
-└── outputs/                 # Generated visualizations
+└── outputs/                 # Generated Excel workbook
 ```
 
 ## Disclaimer

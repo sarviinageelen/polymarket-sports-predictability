@@ -51,14 +51,14 @@ class TestIntegration(unittest.TestCase):
             # Skip test if data hasn't been fetched yet
             self.skipTest("fetch_events.csv not yet generated")
 
-    def test_visualization_exists(self):
-        """Test that visualization exists (if chart has been generated)."""
-        chart_file = self.outputs_dir / 'favourite_win_rates.png'
-        if chart_file.exists():
+    def test_excel_output_exists(self):
+        """Test that Excel output exists (if analysis has been run)."""
+        excel_file = self.outputs_dir / 'favourite_win_rates.xlsx'
+        if excel_file.exists():
             # Verify file is not empty
-            self.assertGreater(chart_file.stat().st_size, 0)
+            self.assertGreater(excel_file.stat().st_size, 0)
         else:
-            self.skipTest("favourite_win_rates.png not yet generated")
+            self.skipTest("favourite_win_rates.xlsx not yet generated")
 
     def test_requirements_file_exists(self):
         """Test that requirements.txt exists and contains key dependencies."""
@@ -72,7 +72,7 @@ class TestIntegration(unittest.TestCase):
         self.assertIn('pandas', content)
         self.assertIn('matplotlib', content)
         self.assertIn('aiohttp', content)
-        self.assertIn('py-clob-client', content)
+        self.assertIn('py_clob_client', content)  # underscore, not hyphen
 
     def test_readme_exists(self):
         """Test that README.md exists and contains key sections."""
@@ -84,7 +84,7 @@ class TestIntegration(unittest.TestCase):
         
         # Check for key sections (may have emojis)
         self.assertIn('# Polymarket Sports Predictability Analysis', content)
-        self.assertIn('Key Findings', content)
+        self.assertIn('Key Results', content)  # Updated section name
         self.assertIn('Installation', content)
         self.assertIn('Usage', content)
 

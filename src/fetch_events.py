@@ -10,7 +10,6 @@ Optimized version with:
 - Smart rate limiting with semaphores and exponential backoff retry
 - Comprehensive error tracking with detailed quality report
 - Excel-friendly CSV formatting
-- 2025 events only for better data completeness
 """
 
 import asyncio
@@ -83,9 +82,6 @@ SPORTS_TO_FETCH = [
     (100149, ["ncaab"]),        # College Basketball (March Madness)
     (101178, ["cbb"]),          # College Basketball (Regular Season)
 ]
-
-# Minimum year for events (filter out older data with incomplete price history)
-MIN_YEAR = 2025
 
 # Cached tag-to-sport mapping (populated at runtime)
 _tag_to_sport_map = None
@@ -379,17 +375,6 @@ def format_date_for_excel(iso_date_str):
         return None
 
 
-def is_2025_or_later(date_str):
-    """Check if a date is in 2025 or later."""
-    if not date_str:
-        return False
-    try:
-        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-        return dt.year >= MIN_YEAR
-    except (ValueError, AttributeError):
-        return False
-
-
 async def fetch_all_events_async(
     session: aiohttp.ClientSession,
     tag_id: int,
@@ -397,7 +382,7 @@ async def fetch_all_events_async(
     gamma_semaphore: asyncio.Semaphore,
     error_tracker: ErrorTracker,
 ) -> list[dict]:
-    """Fetch all events for a tag_id with pagination, filtered to 2025+.
+    """Fetch all events for a tag_id with pagination.
 
     Uses semaphore for rate limiting across concurrent sport fetches.
     """
@@ -437,11 +422,8 @@ async def fetch_all_events_async(
         if not events:
             break
 
-        # Filter to 2025+ events only
-        for event in events:
-            start_date = event.get("startDate", "")
-            if is_2025_or_later(start_date):
-                all_events.append(event)
+        # Add all events (no year filtering)
+        all_events.extend(events)
 
         offset += PAGE_SIZE
         page_num += 1
@@ -826,12 +808,14 @@ async def process_event(session, event, tag_id, clob_markets, price_stats=None):
     game_start_time = clob_data["game_start_time"]
 
     # Use end_date_iso as fallback if game_start_time is missing
+    # WARNING: end_date_iso is market close time, not game start - prices may be post-game
     if not game_start_time:
         game_start_time = clob_data.get("end_date_iso")
         if game_start_time:
-            logger.debug(f"Using end_date_iso fallback for condition {condition_id}")
+            logger.debug(f"Using end_date_iso fallback for condition {condition_id} - prices may be post-game")
         else:
-            logger.warning(f"Missing game_start_time and end_date_iso for condition {condition_id}")
+            logger.debug(f"Missing game_start_time and end_date_iso for condition {condition_id}")
+            return None  # Skip events without any time reference
 
     # Use CLOB winner if available, otherwise fall back to gamma price inference
     if clob_data["winner_index"] is not None:
@@ -1141,6 +1125,55 @@ def print_data_quality_report(all_flattened: list[dict], error_tracker: ErrorTra
     print("=" * 60)
 
 
+def validate_output_data(events: list[dict]) -> bool:
+    """Validate output data for anomalies before saving.
+
+    Checks:
+    - Price ranges (should be 0-1 for binary outcome markets)
+    - Price sums (should be ~1.0 for binary markets)
+    - Winner matches one of the outcomes
+
+    Returns True if no issues found, False otherwise.
+    """
+    issues = []
+
+    for event in events:
+        p1 = event.get("p1_close")
+        p2 = event.get("p2_close")
+        event_id = event.get("event_id", "unknown")
+
+        # Check price ranges (should be 0-1)
+        if p1 is not None and not (0 <= p1 <= 1):
+            issues.append(f"p1_close out of range: {p1} for event {event_id}")
+        if p2 is not None and not (0 <= p2 <= 1):
+            issues.append(f"p2_close out of range: {p2} for event {event_id}")
+
+        # Check price sum (should be ~1.0 for binary markets)
+        if p1 is not None and p2 is not None:
+            price_sum = p1 + p2
+            if not (0.9 <= price_sum <= 1.1):
+                issues.append(f"Price sum {price_sum:.3f} unusual for event {event_id}")
+
+        # Check winner matches an outcome
+        winner = event.get("winner")
+        if winner and event.get("closed") == 1:
+            outcome_1 = event.get("outcome_1", "")
+            outcome_2 = event.get("outcome_2", "")
+            if winner.strip() not in [outcome_1.strip(), outcome_2.strip()]:
+                issues.append(f"Winner '{winner}' doesn't match outcomes for event {event_id}")
+
+    if issues:
+        print(f"\nData validation found {len(issues)} issues:")
+        for issue in issues[:10]:  # Show first 10
+            print(f"  - {issue}")
+        if len(issues) > 10:
+            print(f"  ... and {len(issues) - 10} more")
+        return False
+
+    print("\nData validation passed: all prices in range, sums ~1.0, winners match outcomes")
+    return True
+
+
 async def main_async():
     """Main async entry point - single event loop for entire operation."""
     # Initialize error tracking
@@ -1185,6 +1218,10 @@ async def main_async():
 
     # Sort and save (sync)
     all_flattened.sort(key=get_sort_key)
+
+    # Validate data before saving
+    validate_output_data(all_flattened)
+
     print(f"\nWriting {len(all_flattened)} total events to {OUTPUT_FILE}...")
     save_to_csv(all_flattened, OUTPUT_FILE)
 

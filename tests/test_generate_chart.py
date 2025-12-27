@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for generate_chart.py"""
+"""Tests for generate_insights.py"""
 
 import os
 import sys
@@ -10,7 +10,7 @@ import pandas as pd
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from generate_chart import (
+from generate_insights import (
     calculate_favourite_win_rates,
     SPORT_DISPLAY_NAMES
 )
