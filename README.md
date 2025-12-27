@@ -9,21 +9,19 @@ Statistical analysis of favorite win rates across sports prediction markets usin
 
 This project analyzes sports prediction market efficiency on Polymarket. The primary research question: **What is the empirical win rate of favorites across different professional sports?**
 
-The analysis processes 7,141 closed betting markets across seven sports (ATP, WTA, NBA, NFL, MLB, CFB, CBB), achieving 99.7% data completeness through a hybrid API integration approach.
+The analysis processes 10,115 closed betting markets across 10,223 total events in seven sports (ATP, WTA, NBA, NFL, MLB, CFB, CBB), achieving 99% data completeness through a hybrid API integration approach.
 
 ### Key Results
 
-![Favorite Win Rates by Sport](outputs/favourite_win_rates.png)
-
 | Sport | Favorite Win Rate | Sample Size | Events Analyzed |
 |-------|------------------|-------------|-----------------|
-| College Basketball | 81.2% | 39/48 | 48 |
-| College Football | 74.8% | 593/793 | 793 |
-| ATP Tennis | 69.3% | 1,212/1,748 | 1,748 |
-| NBA Basketball | 67.8% | 945/1,393 | 1,393 |
+| College Basketball | 72.7% | 1,250/1,720 | 1,720 |
+| College Football | 72.9% | 805/1,105 | 1,105 |
+| ATP Tennis | 69.5% | 1,234/1,776 | 1,776 |
+| NBA Basketball | 67.9% | 1,350/1,988 | 1,988 |
 | WTA Tennis | 66.7% | 12/18 | 18 |
-| NFL Football | 65.3% | 192/294 | 294 |
-| MLB Baseball | 56.4% | 1,352/2,397 | 2,397 |
+| NFL Football | 66.6% | 414/622 | 622 |
+| MLB Baseball | 56.5% | 1,385/2,450 | 2,450 |
 
 ## Architecture
 
@@ -49,8 +47,8 @@ The system implements a multi-stage data pipeline integrating two Polymarket API
          │
          ▼
 ┌──────────────────┐
-│  Visualization   │  Statistical output generation
-│  (Matplotlib)    │  Format: 16:9 horizontal bar charts
+│  Excel Output    │  Actionable insights generation
+│  (xlsxwriter)    │  Format: 7-tab workbook with analysis
 └──────────────────┘
 ```
 
@@ -61,7 +59,7 @@ The system implements a multi-stage data pipeline integrating two Polymarket API
 - **99.7% data completeness**: Token ID matching resolves missing price data
 - **Async pipeline**: Concurrent fetching with aiohttp and rate limiting
 - **Error tracking**: Comprehensive retry logic with exponential backoff
-- **Professional visualization**: 16:9 charts with sample size annotations
+- **Actionable Excel output**: 7-tab workbook with betting insights and ROI analysis
 
 ## Installation
 
@@ -97,7 +95,7 @@ python src/fetch_sports.py
 python src/fetch_events.py
 ```
 
-**Output**: `data/fetch_events.csv` (60-90 minutes for 7,141 events)
+**Output**: `data/fetch_events.csv` (60-90 minutes for 10,223 events)
 
 ### Step 3: Generate Insights
 
@@ -120,7 +118,7 @@ The hybrid approach resolves Gamma API's 89% missing price data by matching even
 
 ```text
 data/
-├── fetch_events.csv    # 7,141 events with pricing and settlement
+├── fetch_events.csv    # 10,223 events with pricing and settlement
 └── fetch_sports.csv    # Sports metadata and tag mappings
 
 outputs/
